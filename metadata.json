@@ -1,0 +1,6 @@
+{
+  "name": "CharityLink",
+  "description": "A transparent giving platform for verified charity campaigns with secure profile picture upload and adjustments.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
