@@ -340,9 +340,128 @@ function saveDB(db: DatabaseSchema) {
   }
 }
 
+// Shared donation-recording logic used by both the direct /donate endpoint
+// and the M-Pesa STK callback, so campaign/contribution/user updates only
+// live in one place. Behavior is identical to the previous inline copies.
+async function recordDonation(params: {
+  campaignId: number;
+  donationVal: number;
+  donorEmail?: string;
+  donorName?: string;
+  paymentMethod: string;
+}): Promise<{ campaign: any; contribution: any } | null> {
+  const { campaignId, donationVal, paymentMethod } = params;
+  const resolvedEmail = params.donorEmail ? params.donorEmail.trim().toLowerCase() : "anonymous@charitylink.org";
+  const resolvedName = params.donorName || "Anonymous Steward";
+
+  try {
+    if (isUsingMySQL && pool) {
+      const [campaigns]: any = await pool.query("SELECT * FROM campaigns WHERE id = ?", [campaignId]);
+      if (!campaigns?.[0]) return null;
+      const campaign = campaigns[0];
+
+      const newRaised = campaign.raised + donationVal;
+      const newDonors = campaign.donors + 1;
+      const percentage = Math.round((newRaised / campaign.target) * 100);
+      const impactObj = [
+        { num: `${percentage}%`, lbl: "Target completed" },
+        { num: `KES ${Math.round(newRaised / newDonors).toLocaleString()}`, lbl: "Avg contribution" },
+        { num: `${newDonors}`, lbl: "Steward handshakes" }
+      ];
+
+      await pool.query(
+        "UPDATE campaigns SET raised = ?, donors = ?, impact = ? WHERE id = ?",
+        [newRaised, newDonors, JSON.stringify(impactObj), campaignId]
+      );
+
+      const contributionId = `donation_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+      await pool.query(
+        "INSERT INTO contributions (id, campaignId, campaignTitle, category, donorName, donorEmail, amount, timestamp, paymentMethod) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+          contributionId,
+          campaignId,
+          campaign.title,
+          campaign.category,
+          resolvedName,
+          resolvedEmail,
+          donationVal,
+          new Date().toISOString(),
+          paymentMethod
+        ]
+      );
+
+      if (params.donorEmail) {
+        await pool.query(
+          "UPDATE users SET totalContributed = totalContributed + ?, campaignsSupported = campaignsSupported + 1 WHERE LOWER(email) = ?",
+          [donationVal, resolvedEmail]
+        );
+      }
+
+      const [updatedCampaignRows]: any = await pool.query("SELECT * FROM campaigns WHERE id = ?", [campaignId]);
+      const updatedCampaign = updatedCampaignRows[0];
+      updatedCampaign.verified = Boolean(updatedCampaign.verified);
+      updatedCampaign.impact = JSON.parse(updatedCampaign.impact);
+
+      const contribution = {
+        id: contributionId,
+        campaignId,
+        campaignTitle: campaign.title,
+        category: campaign.category,
+        donorName: resolvedName,
+        donorEmail: resolvedEmail,
+        amount: donationVal,
+        timestamp: new Date().toISOString(),
+        paymentMethod
+      };
+
+      return { campaign: updatedCampaign, contribution };
+    }
+  } catch (err) {
+    console.error("MySQL update error in recordDonation:", err);
+  }
+
+  const db = loadDB();
+  const campaignIndex = db.campaigns.findIndex(c => c.id === campaignId);
+  if (campaignIndex === -1) return null;
+
+  db.campaigns[campaignIndex].raised += donationVal;
+  db.campaigns[campaignIndex].donors += 1;
+
+  const percentage = Math.round((db.campaigns[campaignIndex].raised / db.campaigns[campaignIndex].target) * 100);
+  db.campaigns[campaignIndex].impact = [
+    { num: `${percentage}%`, lbl: "Target completed" },
+    { num: `KES ${Math.round(db.campaigns[campaignIndex].raised / db.campaigns[campaignIndex].donors).toLocaleString()}`, lbl: "Avg contribution" },
+    { num: `${db.campaigns[campaignIndex].donors}`, lbl: "Steward handshakes" }
+  ];
+
+  const newContribution: Contribution = {
+    id: `donation_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+    campaignId,
+    campaignTitle: db.campaigns[campaignIndex].title,
+    category: db.campaigns[campaignIndex].category,
+    donorName: resolvedName,
+    donorEmail: resolvedEmail,
+    amount: donationVal,
+    timestamp: new Date().toISOString(),
+    paymentMethod
+  };
+  db.contributions.push(newContribution);
+
+  if (params.donorEmail) {
+    const userIndex = db.users.findIndex(u => u.email.toLowerCase() === resolvedEmail);
+    if (userIndex !== -1) {
+      db.users[userIndex].totalContributed += donationVal;
+      db.users[userIndex].campaignsSupported += 1;
+    }
+  }
+
+  saveDB(db);
+  return { campaign: db.campaigns[campaignIndex], contribution: newContribution };
+}
+
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   // CRITICAL REQUIREMENT: Parse JSON request bodies of up to 65 megabytes
   app.use(express.json({ limit: "65mb" }));
@@ -661,130 +780,24 @@ async function startServer() {
     }
 
     const donationVal = Number(amount);
-    const resolvedEmail = donorEmail ? donorEmail.trim().toLowerCase() : "anonymous@charitylink.org";
-    const resolvedName = donorName || "Anonymous Steward";
     const resolvedMethod = paymentMethod || "Secure Mobile Wallet";
 
-    try {
-      if (isUsingMySQL && pool) {
-        const [campaigns]: any = await pool.query("SELECT * FROM campaigns WHERE id = ?", [campaignId]);
-        if (campaigns.length === 0) {
-          return res.status(404).json({ error: "Campaign not found." });
-        }
-        const campaign = campaigns[0];
-        const newRaised = campaign.raised + donationVal;
-        const newDonors = campaign.donors + 1;
-        const percentage = Math.round((newRaised / campaign.target) * 100);
-        const impactObj = [
-          { num: `${percentage}%`, lbl: "Target completed" },
-          { num: `KES ${Math.round(newRaised / newDonors).toLocaleString()}`, lbl: "Avg contribution" },
-          { num: `${newDonors}`, lbl: "Steward handshakes" }
-        ];
+    const result = await recordDonation({
+      campaignId,
+      donationVal,
+      donorEmail,
+      donorName,
+      paymentMethod: resolvedMethod
+    });
 
-        await pool.query(
-          "UPDATE campaigns SET raised = ?, donors = ?, impact = ? WHERE id = ?",
-          [newRaised, newDonors, JSON.stringify(impactObj), campaignId]
-        );
-
-        const contributionId = `donation_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
-        await pool.query(
-          "INSERT INTO contributions (id, campaignId, campaignTitle, category, donorName, donorEmail, amount, timestamp, paymentMethod) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          [
-            contributionId,
-            campaignId,
-            campaign.title,
-            campaign.category,
-            resolvedName,
-            resolvedEmail,
-            donationVal,
-            new Date().toISOString(),
-            resolvedMethod
-          ]
-        );
-
-        if (donorEmail) {
-          await pool.query(
-            "UPDATE users SET totalContributed = totalContributed + ?, campaignsSupported = campaignsSupported + 1 WHERE LOWER(email) = ?",
-            [donationVal, resolvedEmail]
-          );
-        }
-
-        const [updatedCampaignRows]: any = await pool.query("SELECT * FROM campaigns WHERE id = ?", [campaignId]);
-        const updatedCampaign = updatedCampaignRows[0];
-        updatedCampaign.verified = Boolean(updatedCampaign.verified);
-        updatedCampaign.impact = JSON.parse(updatedCampaign.impact);
-
-        const newContribution = {
-          id: contributionId,
-          campaignId,
-          campaignTitle: campaign.title,
-          category: campaign.category,
-          donorName: resolvedName,
-          donorEmail: resolvedEmail,
-          amount: donationVal,
-          timestamp: new Date().toISOString(),
-          paymentMethod: resolvedMethod
-        };
-
-        return res.json({
-          success: true,
-          campaign: updatedCampaign,
-          contribution: newContribution
-        });
-      }
-    } catch (err) {
-      console.error("MySQL update error in /api/campaigns/:id/donate:", err);
-    }
-
-    const db = loadDB();
-    const campaignIndex = db.campaigns.findIndex(c => c.id === campaignId);
-
-    if (campaignIndex === -1) {
+    if (!result) {
       return res.status(404).json({ error: "Campaign not found." });
     }
 
-    // Update campaign
-    db.campaigns[campaignIndex].raised += donationVal;
-    db.campaigns[campaignIndex].donors += 1;
-
-  // Recalculate dynamic campaign progress indicators inside the database schema dynamically
-    const percentage = Math.round((db.campaigns[campaignIndex].raised / db.campaigns[campaignIndex].target) * 100);
-
-    db.campaigns[campaignIndex].impact = [
-      { num: `${percentage}%`, lbl: "Target completed" },
-      { num: `KES ${Math.round(db.campaigns[campaignIndex].raised / db.campaigns[campaignIndex].donors).toLocaleString()}`, lbl: "Avg contribution" },
-      { num: `${db.campaigns[campaignIndex].donors}`, lbl: "Steward handshakes" }
-    ];
-
-
-    // Log the transaction contribution row
-    const newContribution: Contribution = {
-      id: `donation_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-      campaignId,
-      campaignTitle: db.campaigns[campaignIndex].title,
-      category: db.campaigns[campaignIndex].category,
-      donorName: resolvedName,
-      donorEmail: resolvedEmail,
-      amount: donationVal,
-      timestamp: new Date().toISOString(),
-      paymentMethod: resolvedMethod
-    };
-    db.contributions.push(newContribution);
-
-    // Update the registered user stats if authentic email matched
-    if (donorEmail) {
-      const userIndex = db.users.findIndex(u => u.email.toLowerCase() === resolvedEmail);
-      if (userIndex !== -1) {
-        db.users[userIndex].totalContributed += donationVal;
-        db.users[userIndex].campaignsSupported += 1;
-      }
-    }
-
-    saveDB(db);
     res.json({
       success: true,
-      campaign: db.campaigns[campaignIndex],
-      contribution: newContribution
+      campaign: result.campaign,
+      contribution: result.contribution
     });
   });
 
@@ -799,7 +812,14 @@ async function startServer() {
 
   const STK_REFERENCE_MAP_PATH = path.join(process.cwd(), "mpesa-reference-map.json");
 
-  type StkRefMap = Record<string, { campaignId: number; amountKES: number; donorEmail?: string; donorName?: string; createdAt: string }>;
+  type StkRefMap = Record<string, {
+    campaignId: number;
+    amountKES: number;
+    donorEmail?: string;
+    donorName?: string;
+    createdAt: string;
+    status: 'pending' | 'completed' | 'failed';
+  }>;
 
   const loadStkRefMap = (): StkRefMap => {
     try {
@@ -869,12 +889,14 @@ async function startServer() {
       const password = Buffer.from(`${shortCode}${passkey}${timestamp}`).toString('base64');
 
       // Normalize phone to include country code 254 for sandbox
-      const phoneDigits = String(phone).trim();
+      const phoneDigits = String(phone).trim().replace(/[\s+\-()]/g, '');
       const normalizedPhone = phoneDigits.startsWith('0')
         ? `254${phoneDigits.slice(1)}`
         : phoneDigits.startsWith('254')
           ? phoneDigits
-          : phoneDigits;
+          : phoneDigits.startsWith('7') || phoneDigits.startsWith('1')
+            ? `254${phoneDigits}`
+            : phoneDigits;
 
       const reference = `CL_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
@@ -885,7 +907,8 @@ async function startServer() {
         amountKES: Number(amountKES),
         donorEmail,
         donorName,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        status: 'pending'
       };
       saveStkRefMap(refMap);
 
@@ -916,7 +939,21 @@ async function startServer() {
       // STK Push returns CheckoutRequestID and MerchantRequestID
       const checkoutRequestId = stkResponse?.CheckoutRequestID;
       if (!checkoutRequestId) {
+        // Push failed to initiate; clean up the pending reference entry.
+        const cleanupMap = loadStkRefMap();
+        delete cleanupMap[reference];
+        saveStkRefMap(cleanupMap);
         return res.status(502).json({ error: 'STK push initiation failed', details: stkResponse });
+      }
+
+      // CheckoutRequestID is the one identifier Safaricom reliably returns in
+      // both this response and the later callback, so re-key the context
+      // under it (keeping the original CL_ reference as a fallback lookup).
+      const finalMap = loadStkRefMap();
+      const ctxEntry = finalMap[reference];
+      if (ctxEntry) {
+        finalMap[checkoutRequestId] = ctxEntry;
+        saveStkRefMap(finalMap);
       }
 
       return res.json({
@@ -943,133 +980,76 @@ async function startServer() {
       const resultCode = stk?.ResultCode;
       const resultDesc = stk?.ResultDesc;
       const callbackMetadata = stk?.CallbackMetadata;
-
-      if (resultCode !== 0) {
-        console.warn('Mpesa callback failed:', resultDesc);
-        return;
-      }
-
-      const accountRef = stk?.MerchantRequestID || '';
-      // AccountReference is not always included in callback; our reference is usually available inside CallbackMetadata
-      // Safaricom sandbox typically includes AccountReference in metadata as Item[0]... but structure can vary.
-      const items: any[] = callbackMetadata?.Item || [];
-      const findItem = (name: string) => items.find(i => i.Name === name)?.Value;
-
-      const receivedAmount = Number(findItem('Amount') ?? 0);
-      const receiptNumber = findItem('MpesaReceiptNumber');
-      const phone = findItem('PhoneNumber');
-
-      // Prefer using a special metadata field if present
-      const referenceFromMeta = findItem('AccountReference') || findItem('AccountReference'.toUpperCase()) || '';
-      const reference = referenceFromMeta || accountRef;
+      const checkoutRequestId = stk?.CheckoutRequestID;
 
       const refMap = loadStkRefMap();
-      const ctx = reference ? refMap[reference] : undefined;
+      // CheckoutRequestID is the reliable key (we re-keyed onto it after the
+      // push response). Fall back to MerchantRequestID/AccountReference for
+      // older entries that only have the original CL_ reference.
+      const items: any[] = callbackMetadata?.Item || [];
+      const findItem = (name: string) => items.find(i => i.Name === name)?.Value;
+      const fallbackRef = findItem('AccountReference') || stk?.MerchantRequestID || '';
+      const lookupKey = (checkoutRequestId && refMap[checkoutRequestId]) ? checkoutRequestId : fallbackRef;
+
+      const ctx = lookupKey ? refMap[lookupKey] : undefined;
       if (!ctx) {
         console.warn('Mpesa callback: reference context not found in map');
         return;
       }
 
-      // Remove reference from map after successful processing
-      if (reference) {
-        delete refMap[reference];
+      if (resultCode !== 0) {
+        console.warn('Mpesa callback failed:', resultDesc);
+        ctx.status = 'failed';
+        refMap[lookupKey] = ctx;
         saveStkRefMap(refMap);
+        return;
       }
+
+      const receivedAmount = Number(findItem('Amount') ?? 0);
 
       const paymentMethod = 'M-Pesa STK Push';
       const donationVal = Number(ctx.amountKES || receivedAmount);
       const campaignId = Number(ctx.campaignId);
 
-      // Reuse existing donation logic for campaign updates + contributions.
-      // To avoid duplication, call internal handler semantics by duplicating minimal update here.
-      const resolvedEmail = ctx.donorEmail ? String(ctx.donorEmail).trim().toLowerCase() : 'anonymous@charitylink.org';
-      const resolvedName = ctx.donorName || 'Anonymous Steward';
+      const result = await recordDonation({
+        campaignId,
+        donationVal,
+        donorEmail: ctx.donorEmail,
+        donorName: ctx.donorName,
+        paymentMethod
+      });
 
-      // Prefer MySQL path by checking isUsingMySQL/pool and performing the same update as /donate.
-      if (isUsingMySQL && pool) {
-        const [campaigns]: any = await pool.query('SELECT * FROM campaigns WHERE id = ?', [campaignId]);
-        if (!campaigns?.[0]) return;
-        const campaign = campaigns[0];
-
-        const newRaised = campaign.raised + donationVal;
-        const newDonors = campaign.donors + 1;
-        const percentage = Math.round((newRaised / campaign.target) * 100);
-        const impactObj = [
-          { num: `${percentage}%`, lbl: 'Target completed' },
-          { num: `KES ${Math.round(newRaised / newDonors).toLocaleString()}`, lbl: 'Avg contribution' },
-          { num: `${newDonors}`, lbl: 'Steward handshakes' }
-        ];
-
-        await pool.query(
-          'UPDATE campaigns SET raised = ?, donors = ?, impact = ? WHERE id = ?',
-          [newRaised, newDonors, JSON.stringify(impactObj), campaignId]
-        );
-
-        const contributionId = `donation_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
-        await pool.query(
-          'INSERT INTO contributions (id, campaignId, campaignTitle, category, donorName, donorEmail, amount, timestamp, paymentMethod) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-          [
-            contributionId,
-            campaignId,
-            campaign.title,
-            campaign.category,
-            resolvedName,
-            resolvedEmail,
-            donationVal,
-            new Date().toISOString(),
-            paymentMethod
-          ]
-        );
-
-        if (ctx.donorEmail) {
-          await pool.query(
-            'UPDATE users SET totalContributed = totalContributed + ?, campaignsSupported = campaignsSupported + 1 WHERE LOWER(email) = ?',
-            [donationVal, resolvedEmail]
-          );
-        }
+      if (!result) {
+        console.warn('Mpesa callback: campaign not found for id', campaignId);
+        ctx.status = 'failed';
+        refMap[lookupKey] = ctx;
+        saveStkRefMap(refMap);
         return;
       }
 
-      const db = loadDB();
-      const campaignIndex = db.campaigns.findIndex(c => c.id === campaignId);
-      if (campaignIndex === -1) return;
-
-      db.campaigns[campaignIndex].raised += donationVal;
-      db.campaigns[campaignIndex].donors += 1;
-
-      const percentage = Math.round((db.campaigns[campaignIndex].raised / db.campaigns[campaignIndex].target) * 100);
-      db.campaigns[campaignIndex].impact = [
-        { num: `${percentage}%`, lbl: 'Target completed' },
-        { num: `KES ${Math.round(db.campaigns[campaignIndex].raised / db.campaigns[campaignIndex].donors).toLocaleString()}`, lbl: 'Avg contribution' },
-        { num: `${db.campaigns[campaignIndex].donors}`, lbl: 'Steward handshakes' }
-      ];
-
-      const newContribution: Contribution = {
-        id: `donation_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-        campaignId,
-        campaignTitle: db.campaigns[campaignIndex].title,
-        category: db.campaigns[campaignIndex].category,
-        donorName: resolvedName,
-        donorEmail: resolvedEmail,
-        amount: donationVal,
-        timestamp: new Date().toISOString(),
-        paymentMethod
-      };
-
-      db.contributions.push(newContribution);
-
-      if (ctx.donorEmail) {
-        const userIndex = db.users.findIndex(u => u.email.toLowerCase() === resolvedEmail);
-        if (userIndex !== -1) {
-          db.users[userIndex].totalContributed += donationVal;
-          db.users[userIndex].campaignsSupported += 1;
-        }
-      }
-
-      saveDB(db);
+      // Mark completed rather than deleting, so the polling endpoint can
+      // still report success to the frontend after the donation is recorded.
+      ctx.status = 'completed';
+      refMap[lookupKey] = ctx;
+      saveStkRefMap(refMap);
     } catch (err) {
       console.error('Mpesa callback handler error:', err);
     }
+  });
+
+  // Poll STK push status (used by the frontend to detect success/failure
+  // after initiating a push, since the callback arrives asynchronously).
+  app.get('/api/mpesa/status/:checkoutRequestId', async (req, res) => {
+    const { checkoutRequestId } = req.params;
+    const refMap = loadStkRefMap();
+    const ctx = refMap[checkoutRequestId];
+
+    if (!ctx) {
+      // Either never existed, or was cleaned up; treat as unknown.
+      return res.json({ status: 'unknown' });
+    }
+
+    res.json({ status: ctx.status || 'pending' });
   });
 
   // Get user contributions ledger

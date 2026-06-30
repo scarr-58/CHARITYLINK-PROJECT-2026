@@ -1561,7 +1561,7 @@ export default function App() {
             <p className="text-emerald-300 font-medium">Empowering local communities with 100% verified, zero-commission giving frameworks.</p>
           </div>
           <div className="text-emerald-300 font-semibold select-none text-center md:text-right">
-            © 2026 CharityLink · Transparent Giving Platform · Built with React + Tailwind v4 + esbuild
+            © 2026 CharityLink · Transparent Giving Platform
           </div>
         </div>
       </footer>
