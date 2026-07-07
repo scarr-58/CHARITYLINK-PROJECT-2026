@@ -28,12 +28,42 @@ import {
   Activity,
   Trash2,
   Users2,
-  ShieldAlert
+  ShieldAlert,
+  BarChart3,
+  TrendingUp,
+  Trophy,
+  Crown,
+  Medal,
+  Moon,
+  Sun,
+  Download,
+  Pencil,
+  Wand2,
+  Filter,
+  PartyPopper
 } from 'lucide-react';
 import { Campaign, User, UserRole, ImpactItem } from './types';
 import { INITIAL_CAMPAIGNS, CATEGORIES } from './data';
 import ImageCropper from './components/ImageCropper';
+import { DonutChart, HBarChart, AreaChart, categoryColor } from './components/Charts';
 import { motion, AnimatePresence } from 'motion/react';
+
+// Donor giving tiers (mirrors the server thresholds).
+const GIVING_TIERS = [
+  { name: 'Seedling', min: 0, icon: '🌱', color: '#94a3b8' },
+  { name: 'Bronze Guardian', min: 5000, icon: '🥉', color: '#b45309' },
+  { name: 'Silver Guardian', min: 25000, icon: '🥈', color: '#64748b' },
+  { name: 'Gold Guardian', min: 75000, icon: '🥇', color: '#d97706' },
+  { name: 'Platinum Guardian', min: 200000, icon: '💎', color: '#0ea5e9' },
+];
+function tierFor(total: number) {
+  let current = GIVING_TIERS[0];
+  for (const t of GIVING_TIERS) if (total >= t.min) current = t;
+  const idx = GIVING_TIERS.indexOf(current);
+  const next = GIVING_TIERS[idx + 1] || null;
+  const progress = next ? Math.min(100, Math.round(((total - current.min) / (next.min - current.min)) * 100)) : 100;
+  return { current, next, progress };
+}
 
 export default function App() {
   // --- STATE ---
@@ -53,10 +83,10 @@ export default function App() {
 
   const [myContributions, setMyContributions] = useState<any[]>([]);
 
-  const [activePage, setActivePage] = useState<'home' | 'browse' | 'detail' | 'login' | 'profile'>(() => {
+  const [activePage, setActivePage] = useState<'home' | 'browse' | 'detail' | 'login' | 'profile' | 'analytics'>(() => {
     // Sync starting view with current user existence or simple routing
     const path = window.location.hash.replace('#', '');
-    if (['home', 'browse', 'detail', 'login', 'profile'].includes(path)) {
+    if (['home', 'browse', 'detail', 'login', 'profile', 'analytics'].includes(path)) {
       return path as any;
     }
     return 'home';
@@ -128,6 +158,32 @@ export default function App() {
   const [adminUsers, setAdminUsers] = useState<any[]>([]);
   const [adminContributions, setAdminContributions] = useState<any[]>([]);
 
+  // Dark mode (persisted; defaults to the OS preference)
+  const [darkMode, setDarkMode] = useState<boolean>(() => {
+    const saved = localStorage.getItem('charitylink_theme');
+    if (saved) return saved === 'dark';
+    return typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches;
+  });
+
+  // Analytics / activity / leaderboard data
+  const [analytics, setAnalytics] = useState<any | null>(null);
+  const [activityFeed, setActivityFeed] = useState<any[]>([]);
+  const [leaderboard, setLeaderboard] = useState<any[]>([]);
+
+  // Browse sort order
+  const [sortBy, setSortBy] = useState<'default' | 'mostFunded' | 'nearlyThere' | 'newest' | 'mostDonors'>('default');
+
+  // Campaign editing (reuses the Start Campaign modal in edit mode)
+  const [editingCampaignId, setEditingCampaignId] = useState<number | null>(null);
+
+  // AI assistant states
+  const [aiCopyLoading, setAiCopyLoading] = useState<boolean>(false);
+  const [aiImpactText, setAiImpactText] = useState<string>('');
+  const [aiImpactLoading, setAiImpactLoading] = useState<boolean>(false);
+
+  // Celebration confetti
+  const [showConfetti, setShowConfetti] = useState<boolean>(false);
+
   // Error States
   const [errors, setErrors] = useState<{ [key: string]: string }>({});
 
@@ -138,6 +194,38 @@ export default function App() {
   useEffect(() => {
     window.location.hash = activePage;
   }, [activePage]);
+
+  // Apply & persist the theme by toggling `.dark` on the <html> element.
+  useEffect(() => {
+    const root = document.documentElement;
+    if (darkMode) root.classList.add('dark');
+    else root.classList.remove('dark');
+    localStorage.setItem('charitylink_theme', darkMode ? 'dark' : 'light');
+  }, [darkMode]);
+
+  // Load public analytics, activity feed and leaderboard.
+  const fetchAnalytics = async () => {
+    try {
+      const [aRes, actRes, lbRes] = await Promise.all([
+        fetch('/api/analytics'),
+        fetch('/api/activity?limit=15'),
+        fetch('/api/leaderboard'),
+      ]);
+      if (aRes.ok) setAnalytics(await aRes.json());
+      if (actRes.ok) setActivityFeed(await actRes.json());
+      if (lbRes.ok) setLeaderboard(await lbRes.json());
+    } catch (e) {
+      console.error('Failed to load analytics/activity/leaderboard.', e);
+    }
+  };
+  useEffect(() => {
+    fetchAnalytics();
+  }, []);
+
+  // Reset the AI impact text whenever a different campaign is opened.
+  useEffect(() => {
+    setAiImpactText('');
+  }, [selectedCampaignId]);
 
   // Load campaigns from server database
   const fetchCampaigns = async () => {
@@ -338,6 +426,8 @@ export default function App() {
           setLastDonation({ amount: finalAmount, campaignTitle: selectedCampaignTitle, method: 'M-Pesa STK Push' });
           setQdSuccess(true);
           setQdCustomStr('');
+          triggerConfetti();
+          fetchAnalytics();
           triggerToast(`Thank you! KES ${finalAmount.toLocaleString()} received via M-Pesa! 🎉`);
         } else if (outcome === 'failed') {
           triggerToast('M-Pesa payment was declined or cancelled. Please try again.');
@@ -374,6 +464,8 @@ export default function App() {
               setLastDonation({ amount: finalAmount, campaignTitle: selectedCampaignTitle, method: qdMethod });
               setQdSuccess(true);
               setQdCustomStr('');
+              triggerConfetti();
+              fetchAnalytics();
               triggerToast(`Thank you! KES ${finalAmount.toLocaleString()} verified and recorded! 🎉`);
             } else {
               triggerToast("Failed to process transaction on server.");
@@ -589,6 +681,8 @@ export default function App() {
         setDonationSuccess(true);
         setShowReceiptModal(true);
         setCustomAmountStr('');
+        triggerConfetti();
+        fetchAnalytics();
         triggerToast(`Successfully contributed KES ${finalAmount.toLocaleString()}! Thank you for your transparency!`);
       } else {
         triggerToast("Failed to process donation transaction.");
@@ -662,9 +756,162 @@ export default function App() {
     return 'timeout';
   };
 
+  // Fire a short confetti celebration.
+  const triggerConfetti = () => {
+    setShowConfetti(true);
+    setTimeout(() => setShowConfetti(false), 3200);
+  };
+
+  // Generate & download a PNG donation receipt from the last donation.
+  const downloadReceipt = () => {
+    if (!lastDonation) return;
+    const W = 720, H = 460;
+    const canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#0a3d1f'; ctx.fillRect(0, 0, W, 96);
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 30px Inter, Arial, sans-serif';
+    ctx.fillText('CharityLink', 40, 50);
+    ctx.fillStyle = '#8fd6a9'; ctx.font = '15px Inter, Arial, sans-serif';
+    ctx.fillText('Official Donation Receipt · Transparent Giving', 40, 76);
+
+    ctx.fillStyle = '#94a3b8'; ctx.font = 'bold 12px Inter, Arial, sans-serif';
+    ctx.fillText('AMOUNT DONATED', 40, 150);
+    ctx.fillStyle = '#0a3d1f'; ctx.font = 'bold 52px Inter, Arial, sans-serif';
+    ctx.fillText(`KES ${lastDonation.amount.toLocaleString()}`, 40, 205);
+
+    const rows: [string, string][] = [
+      ['Campaign', lastDonation.campaignTitle],
+      ['Payment Method', lastDonation.method],
+      ['Donor', currentUser?.name || 'Anonymous Steward'],
+      ['Date', new Date().toLocaleString()],
+      ['Status', 'CONFIRMED ✓'],
+    ];
+    let y = 260;
+    ctx.textBaseline = 'alphabetic';
+    for (const [k, v] of rows) {
+      ctx.fillStyle = '#64748b'; ctx.font = 'bold 14px Inter, Arial, sans-serif';
+      ctx.fillText(k, 40, y);
+      ctx.fillStyle = '#0f172a'; ctx.font = '15px Inter, Arial, sans-serif';
+      const text = v.length > 52 ? v.slice(0, 51) + '…' : v;
+      ctx.fillText(text, 230, y);
+      ctx.strokeStyle = '#eef2f0'; ctx.beginPath(); ctx.moveTo(40, y + 14); ctx.lineTo(W - 40, y + 14); ctx.stroke();
+      y += 40;
+    }
+    ctx.fillStyle = '#94a3b8'; ctx.font = '12px Inter, Arial, sans-serif';
+    ctx.fillText('100% verified · zero-commission · every shilling tracked in real time.', 40, H - 24);
+
+    const a = document.createElement('a');
+    a.href = canvas.toDataURL('image/png');
+    a.download = `charitylink-receipt-${Date.now()}.png`;
+    a.click();
+    triggerToast('Receipt downloaded 📄');
+  };
+
+  // AI: generate campaign copy from a one-line idea (fills the Start Campaign form).
+  const handleGenerateCopy = async () => {
+    if (!ncShort.trim() && !ncTitle.trim()) {
+      triggerToast('Type a short idea or title first, then let AI expand it.');
+      return;
+    }
+    setAiCopyLoading(true);
+    try {
+      const res = await fetch('/api/ai/campaign-copy', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idea: ncShort || ncTitle, category: ncCategory, org: ncOrg })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setNcShort(data.short || ncShort);
+        setNcDesc(data.desc || ncDesc);
+        triggerToast(data.source === 'ai' ? 'AI drafted your campaign copy ✨' : 'Draft generated ✨ (add a GEMINI_API_KEY for live AI)');
+      } else {
+        triggerToast('Could not generate copy right now.');
+      }
+    } catch {
+      triggerToast('Network error contacting the AI assistant.');
+    } finally {
+      setAiCopyLoading(false);
+    }
+  };
+
+  // AI: fetch a tangible impact sentence for the current donation amount.
+  const fetchAiImpact = async (campaign: Campaign, amount: number) => {
+    if (!amount || amount <= 0) { setAiImpactText(''); return; }
+    setAiImpactLoading(true);
+    try {
+      const res = await fetch('/api/ai/impact', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ amount, campaignTitle: campaign.title, category: campaign.category })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setAiImpactText(data.text || '');
+      }
+    } catch {
+      setAiImpactText('');
+    } finally {
+      setAiImpactLoading(false);
+    }
+  };
+
+  // Open the campaign modal in EDIT mode, pre-filled with a campaign's values.
+  const handleOpenEditCampaign = (c: Campaign) => {
+    setEditingCampaignId(c.id);
+    setNcTitle(c.title);
+    setNcOrg(c.org);
+    setNcDesc(c.desc);
+    setNcShort(c.short);
+    setNcTarget(String(c.target));
+    setNcCategory(c.category);
+    setNcIcon(c.icon);
+    setNcColor(c.color);
+    setNcSuccess(false);
+    setShowStartCampaignModal(true);
+  };
+
+  // Save edits to an existing campaign.
+  const handleUpdateCampaign = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!currentUser || editingCampaignId === null) return;
+    const targetNum = Number(ncTarget);
+    if (!ncTitle || !ncOrg || !ncDesc || !ncShort || isNaN(targetNum) || targetNum <= 0) {
+      triggerToast('Please complete all fields with a valid target.');
+      return;
+    }
+    try {
+      const res = await fetch(`/api/campaigns/${editingCampaignId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: ncTitle, org: ncOrg, desc: ncDesc, short: ncShort,
+          target: targetNum, category: ncCategory, icon: ncIcon, color: ncColor,
+          requesterEmail: currentUser.email
+        })
+      });
+      if (res.ok) {
+        await fetchCampaigns();
+        if (role === 'admin') await fetchAdminData();
+        triggerToast('Campaign updated successfully.');
+        setShowStartCampaignModal(false);
+        setEditingCampaignId(null);
+      } else {
+        const err = await res.json().catch(() => ({}));
+        triggerToast(err.error || 'Failed to update campaign.');
+      }
+    } catch {
+      triggerToast('Network error updating campaign.');
+    }
+  };
+
   // --- COMPUTED ---
-  const activeCampaign = selectedCampaignId !== null 
-    ? campaigns.find(c => c.id === selectedCampaignId) 
+  const activeCampaign = selectedCampaignId !== null
+    ? campaigns.find(c => c.id === selectedCampaignId)
     : null;
 
   const filteredCampaigns = campaigns.filter(c => {
@@ -673,6 +920,14 @@ export default function App() {
                           c.short.toLowerCase().includes(searchQuery.toLowerCase()) ||
                           c.org.toLowerCase().includes(searchQuery.toLowerCase());
     return matchesCat && matchesSearch;
+  }).sort((a, b) => {
+    switch (sortBy) {
+      case 'mostFunded': return b.raised - a.raised;
+      case 'nearlyThere': return (b.raised / b.target) - (a.raised / a.target);
+      case 'newest': return b.id - a.id;
+      case 'mostDonors': return b.donors - a.donors;
+      default: return 0;
+    }
   });
 
   // --- ROLE-BASED ACCESS HELPERS ---
@@ -701,9 +956,20 @@ export default function App() {
     if (n >= 1_000) return `KES ${(n / 1_000).toFixed(0)}K`;
     return `KES ${n.toLocaleString()}`;
   };
+  const timeAgo = (ts: string): string => {
+    const diff = Date.now() - new Date(ts).getTime();
+    const m = Math.floor(diff / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    const d = Math.floor(h / 24);
+    return `${d}d ago`;
+  };
+  const methodColors = ['#2a78d6', '#1baf7a', '#eda100', '#e34948'];
 
   return (
-    <div className="min-h-screen bg-[#f4f6f4] text-[#1c2b22] font-sans flex flex-col antialiased selection:bg-emerald-100 selection:text-emerald-900">
+    <div className="min-h-screen bg-[#f4f6f4] dark:bg-[#0a120e] text-[#1c2b22] dark:text-gray-100 font-sans flex flex-col antialiased selection:bg-emerald-100 selection:text-emerald-900 transition-colors">
       
       {/* ── HEADER NAVIGATION ── */}
       <nav className="bg-[#0a3d1f] text-white px-4 md:px-8 py-3 sticky top-0 z-50 shadow-md">
@@ -742,12 +1008,30 @@ export default function App() {
             >
               Campaigns
             </button>
+            <button
+              onClick={() => setActivePage('analytics')}
+              className={`hidden sm:inline-flex items-center gap-1 text-sm font-semibold transition-colors cursor-pointer hover:text-white ${activePage === 'analytics' ? 'text-white underline underline-offset-4 decoration-2 decoration-emerald-400' : 'text-emerald-200'}`}
+              id="nav-insights"
+            >
+              <BarChart3 className="w-4 h-4" /> Insights
+            </button>
+
+            {/* Dark mode toggle */}
+            <button
+              onClick={() => setDarkMode(d => !d)}
+              title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+              className="text-emerald-200 hover:text-white transition-colors cursor-pointer p-1.5 rounded-lg hover:bg-white/10"
+            >
+              {darkMode ? <Sun className="w-4.5 h-4.5" /> : <Moon className="w-4.5 h-4.5" />}
+            </button>
 
             {/* Quick Trigger CTAs — creating campaigns is restricted to
                 organisation and admin accounts. */}
             {canCreateCampaign && (
               <button
                 onClick={() => {
+                  setEditingCampaignId(null);
+                  setNcTitle(''); setNcOrg(''); setNcDesc(''); setNcShort(''); setNcTarget('300000');
                   setNcSuccess(false);
                   setShowStartCampaignModal(true);
                 }}
@@ -852,7 +1136,7 @@ export default function App() {
             </section>
 
             {/* Micro Stats Belt */}
-            <section className="bg-white border-b border-emerald-100/60 shadow-sm">
+            <section className="bg-white dark:bg-[#0f1c16] border-b border-emerald-100/60 dark:border-white/10 shadow-sm">
               <div className="max-w-7xl mx-auto grid grid-cols-2 md:grid-cols-4 divide-y md:divide-y-0 md:divide-x divide-emerald-100/40">
                 <div className="py-6 px-4 text-center">
                   <div className="text-2xl md:text-3xl font-bold text-[#145a32]">{formatKES(totalRaised)}</div>
@@ -877,8 +1161,8 @@ export default function App() {
             <section className="max-w-7xl mx-auto px-4 md:px-8 py-12 w-full">
               <div className="flex justify-between items-baseline mb-8">
                 <div>
-                  <h2 className="font-serif text-2xl font-bold text-[#0a3d1f]">Featured Campaigns</h2>
-                  <p className="text-gray-500 text-xs mt-1">High-priority humanitarian and environmental tasks in urgent need of assistance</p>
+                  <h2 className="font-serif text-2xl font-bold text-[#0a3d1f] dark:text-white">Featured Campaigns</h2>
+                  <p className="text-gray-500 dark:text-gray-400 text-xs mt-1">High-priority humanitarian and environmental tasks in urgent need of assistance</p>
                 </div>
                 <button 
                   onClick={() => {
@@ -903,7 +1187,7 @@ export default function App() {
                         setDonationSuccess(false);
                         setActivePage('detail');
                       }}
-                      className="bg-white rounded-xl overflow-hidden shadow-sm hover:shadow-md border border-emerald-50/70 transition-all hover:-translate-y-1 cursor-pointer flex flex-col h-full"
+                      className="bg-white dark:bg-[#13251c] rounded-xl overflow-hidden shadow-sm hover:shadow-md border border-emerald-50/70 dark:border-white/10 transition-all hover:-translate-y-1 cursor-pointer flex flex-col h-full"
                     >
                       {/* Splash Icon Wrapper */}
                       <div 
@@ -924,7 +1208,7 @@ export default function App() {
                           )}
                         </div>
 
-                        <h3 className="font-bold text-gray-900 leading-snug mb-2 group-hover:text-emerald-800 transition-colors line-clamp-2">
+                        <h3 className="font-bold text-gray-900 dark:text-white leading-snug mb-2 group-hover:text-emerald-800 transition-colors line-clamp-2">
                           {c.title}
                         </h3>
                         <p className="text-gray-500 text-xs leading-relaxed mb-6 line-clamp-3">
@@ -1003,7 +1287,7 @@ export default function App() {
             </section>
 
             {/* Filter Row Categories Belt */}
-            <section className="bg-white border-b border-emerald-50 shadow-sm sticky top-[58px] z-40">
+            <section className="bg-white dark:bg-[#0f1c16] border-b border-emerald-50 dark:border-white/10 shadow-sm sticky top-[58px] z-40">
               <div className="max-w-7xl mx-auto px-4 md:px-8 py-3 flex gap-2 overflow-x-auto scrollbar-none select-none">
                 {CATEGORIES.map((cat) => (
                   <button
@@ -1019,12 +1303,26 @@ export default function App() {
 
             {/* List Body */}
             <section className="max-w-7xl mx-auto px-4 md:px-8 py-10 w-full flex-1">
-              <div className="text-sm text-gray-500 mb-6 flex justify-between items-center">
-                <span>Showing <strong className="text-gray-900 font-bold">{filteredCampaigns.length}</strong> campaign{filteredCampaigns.length !== 1 ? 's' : ''}</span>
+              <div className="text-sm text-gray-500 dark:text-gray-400 mb-6 flex justify-between items-center gap-3">
+                <span>Showing <strong className="text-gray-900 dark:text-white font-bold">{filteredCampaigns.length}</strong> campaign{filteredCampaigns.length !== 1 ? 's' : ''}</span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <Filter className="w-4 h-4 text-gray-400" />
+                  <select
+                    value={sortBy}
+                    onChange={(e) => setSortBy(e.target.value as any)}
+                    className="bg-white dark:bg-[#13251c] dark:text-white text-xs font-bold py-1.5 px-2.5 border border-gray-200 dark:border-white/10 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-400 cursor-pointer"
+                  >
+                    <option value="default">Sort: Featured</option>
+                    <option value="mostFunded">Most Funded</option>
+                    <option value="nearlyThere">Nearly There</option>
+                    <option value="mostDonors">Most Donors</option>
+                    <option value="newest">Newest</option>
+                  </select>
+                </div>
               </div>
 
               {filteredCampaigns.length === 0 ? (
-                <div className="bg-white rounded-xl shadow-xs border border-emerald-50/50 p-12 text-center max-w-lg mx-auto mt-6">
+                <div className="bg-white dark:bg-[#13251c] rounded-xl shadow-xs border border-emerald-50/50 dark:border-white/10 p-12 text-center max-w-lg mx-auto mt-6">
                   <div className="text-4xl mb-4 text-emerald-800 font-bold">🔍</div>
                   <h3 className="font-bold text-gray-800 text-base mb-1">No campaigns matched your request</h3>
                   <p className="text-gray-500 text-xs mb-4">Try clearing your filters or entering a different search term.</p>
@@ -1050,7 +1348,7 @@ export default function App() {
                           setDonationSuccess(false);
                           setActivePage('detail');
                         }}
-                        className="bg-white rounded-xl overflow-hidden shadow-sm hover:shadow-md border border-emerald-50/70 transition-all hover:-translate-y-1 cursor-pointer flex flex-col h-full"
+                        className="bg-white dark:bg-[#13251c] rounded-xl overflow-hidden shadow-sm hover:shadow-md border border-emerald-50/70 dark:border-white/10 transition-all hover:-translate-y-1 cursor-pointer flex flex-col h-full"
                       >
                         <div
                           className="py-10 text-center text-5xl select-none relative"
@@ -1084,7 +1382,7 @@ export default function App() {
                           <h3 className="font-bold text-gray-900 leading-snug mb-2 group-hover:text-emerald-800 transition-colors line-clamp-2">
                             {c.title}
                           </h3>
-                          <p className="text-gray-500 text-xs leading-relaxed mb-6 line-clamp-3">
+                          <p className="text-gray-500 dark:text-gray-400 text-xs leading-relaxed mb-6 line-clamp-3">
                             {c.short}
                           </p>
 
@@ -1167,29 +1465,29 @@ export default function App() {
               <div className="md:col-span-2 space-y-8">
                 
                 {/* Visual Icon */}
-                <div className="bg-white rounded-xl shadow-xs p-6 border border-emerald-50 flex items-center gap-5">
+                <div className="bg-white dark:bg-[#13251c] rounded-xl shadow-xs p-6 border border-emerald-50 dark:border-white/10 flex items-center gap-5">
                   <div className="w-16 h-16 rounded-xl flex items-center justify-center text-4xl select-none" style={{ backgroundColor: activeCampaign.color }}>
                     {activeCampaign.icon}
                   </div>
                   <div>
-                    <h4 className="font-bold text-gray-900 text-sm">{activeCampaign.org}</h4>
+                    <h4 className="font-bold text-gray-900 dark:text-white text-sm">{activeCampaign.org}</h4>
                     <p className="text-xs text-gray-500 mt-0.5">Verified NGO Partner · Nairobi Registry Office</p>
                   </div>
                 </div>
 
                 {/* About Campaign */}
-                <div className="bg-white rounded-xl shadow-xs p-6 border border-emerald-50">
-                  <h3 className="font-serif text-[#0a3d1f] font-bold text-lg border-b-2 border-emerald-50 pb-3 mb-4">
+                <div className="bg-white dark:bg-[#13251c] rounded-xl shadow-xs p-6 border border-emerald-50 dark:border-white/10">
+                  <h3 className="font-serif text-[#0a3d1f] dark:text-white font-bold text-lg border-b-2 border-emerald-50 dark:border-white/10 pb-3 mb-4">
                     About This Campaign
                   </h3>
-                  <p className="text-gray-600 text-sm leading-relaxed whitespace-pre-line font-medium">
+                  <p className="text-gray-600 dark:text-gray-300 text-sm leading-relaxed whitespace-pre-line font-medium">
                     {activeCampaign.desc}
                   </p>
                 </div>
 
                 {/* Impact stats grid */}
-                <div className="bg-white rounded-xl shadow-xs p-6 border border-emerald-50">
-                  <h3 className="font-serif text-[#0a3d1f] font-bold text-lg border-b-2 border-emerald-50 pb-3 mb-4">
+                <div className="bg-white dark:bg-[#13251c] rounded-xl shadow-xs p-6 border border-emerald-50 dark:border-white/10">
+                  <h3 className="font-serif text-[#0a3d1f] dark:text-white font-bold text-lg border-b-2 border-emerald-50 dark:border-white/10 pb-3 mb-4">
                     Impact So Far
                   </h3>
                   <div className="grid grid-cols-3 gap-4">
@@ -1203,11 +1501,11 @@ export default function App() {
                 </div>
 
                 {/* Financial transparency breakdown */}
-                <div className="bg-white rounded-xl shadow-xs p-6 border border-emerald-50">
-                  <h3 className="font-serif text-[#0a3d1f] font-bold text-lg border-b-2 border-emerald-50 pb-3 mb-4">
+                <div className="bg-white dark:bg-[#13251c] rounded-xl shadow-xs p-6 border border-emerald-50 dark:border-white/10">
+                  <h3 className="font-serif text-[#0a3d1f] dark:text-white font-bold text-lg border-b-2 border-emerald-50 dark:border-white/10 pb-3 mb-4">
                     How Funds Are Used
                   </h3>
-                  <p className="text-gray-600 text-sm leading-relaxed font-medium">
+                  <p className="text-gray-600 dark:text-gray-300 text-sm leading-relaxed font-medium">
                     {activeCampaign.usage}
                   </p>
                 </div>
@@ -1215,11 +1513,11 @@ export default function App() {
 
               {/* Right Column Sidebar Widget */}
               <div>
-                <div className="bg-white rounded-xl shadow-md border border-emerald-50/80 p-6 sticky top-[90px] space-y-6">
+                <div className="bg-white dark:bg-[#13251c] rounded-xl shadow-md border border-emerald-50/80 dark:border-white/10 p-6 sticky top-[90px] space-y-6">
                   
                   {/* Progress Header */}
                   <div>
-                    <h3 className="text-lg font-serif font-bold text-[#0a3d1f] mb-3">Campaign Progress</h3>
+                    <h3 className="text-lg font-serif font-bold text-[#0a3d1f] dark:text-white mb-3">Campaign Progress</h3>
                     <div className="text-3xl font-serif font-black text-emerald-800 leading-none">
                       KES {activeCampaign.raised.toLocaleString()}
                     </div>
@@ -1301,8 +1599,8 @@ export default function App() {
                         {/* Custom Input */}
                         <div className="relative">
                           <span className="absolute left-3 top-2.5 text-xs text-gray-400 font-bold">KES</span>
-                          <input 
-                            type="number" 
+                          <input
+                            type="number"
                             placeholder="Other Custom Amount"
                             value={customAmountStr}
                             onChange={(e) => setCustomAmountStr(e.target.value)}
@@ -1310,8 +1608,25 @@ export default function App() {
                           />
                         </div>
 
+                        {/* AI impact explainer */}
+                        <button
+                          type="button"
+                          onClick={() => fetchAiImpact(activeCampaign, customAmountStr ? parseInt(customAmountStr) : donationAmount)}
+                          disabled={aiImpactLoading}
+                          className="w-full flex items-center justify-center gap-1.5 text-[11px] font-bold text-emerald-700 hover:text-emerald-900 border border-dashed border-emerald-300 hover:bg-emerald-50 rounded-lg py-2 transition-colors cursor-pointer disabled:opacity-50"
+                        >
+                          {aiImpactLoading ? <Activity className="w-3.5 h-3.5 animate-pulse" /> : <Wand2 className="w-3.5 h-3.5" />}
+                          {aiImpactLoading ? 'Calculating impact…' : 'Show my impact with AI'}
+                        </button>
+                        {aiImpactText && (
+                          <div className="bg-gradient-to-br from-emerald-50 to-blue-50 border border-emerald-100 rounded-lg p-3 flex gap-2">
+                            <Sparkles className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                            <p className="text-[11px] text-emerald-900 leading-relaxed font-medium">{aiImpactText}</p>
+                          </div>
+                        )}
+
                     {/* Execute */}
-                        <button 
+                        <button
                           onClick={() => {
                             // default method in this UI section is M-Pesa
                             handleDonateSubmit(activeCampaign.id);
@@ -1331,15 +1646,22 @@ export default function App() {
                       Share Campaign Link
                     </button>
 
-                    {/* Management: delete is restricted to admins and the owning organisation */}
+                    {/* Management: edit/delete restricted to admins and the owning organisation */}
                     {canDeleteCampaign(activeCampaign) && (
-                      <button
-                        onClick={() => handleDeleteCampaign(activeCampaign)}
-                        className="w-full border border-red-200 bg-red-50/50 text-red-600 hover:bg-red-100 hover:border-red-300 text-xs font-bold py-2.5 rounded-lg transition-colors cursor-pointer flex items-center justify-center gap-1.5"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" /> Delete Campaign
-                        <span className="font-normal text-red-400">({role === 'admin' ? 'Admin' : 'Owner'})</span>
-                      </button>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => handleOpenEditCampaign(activeCampaign)}
+                          className="flex-1 border border-emerald-200 bg-emerald-50/50 text-emerald-700 hover:bg-emerald-100 text-xs font-bold py-2.5 rounded-lg transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+                        >
+                          <Pencil className="w-3.5 h-3.5" /> Edit
+                        </button>
+                        <button
+                          onClick={() => handleDeleteCampaign(activeCampaign)}
+                          className="flex-1 border border-red-200 bg-red-50/50 text-red-600 hover:bg-red-100 hover:border-red-300 text-xs font-bold py-2.5 rounded-lg transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" /> Delete
+                        </button>
+                      </div>
                     )}
                   </div>
                 </div>
@@ -1596,14 +1918,14 @@ export default function App() {
         {/* 5. USER PROFILE SYSTEM SYSTEM DASHBOARD */}
         {activePage === 'profile' && (
           <div className="max-w-7xl mx-auto px-4 md:px-8 py-10 w-full flex-1 flex flex-col anim-fade-in text-gray-800">
-            <h1 className="font-serif text-3xl font-bold text-[#0a3d1f] mb-2">My Transparent Stewardship</h1>
+            <h1 className="font-serif text-3xl font-bold text-[#0a3d1f] dark:text-white mb-2">My Transparent Stewardship</h1>
             <p className="text-gray-500 text-sm mb-8">Inspect your verified donations ledger and adjust your circle profile photo seamlessly.</p>
             
             {currentUser ? (
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 items-start">
                 
                 {/* Visual Circle Profile Info Box */}
-                <div className="bg-white rounded-2xl p-6 shadow-sm border border-emerald-50/70 text-center flex flex-col items-center">
+                <div className="bg-white dark:bg-[#13251c] rounded-2xl p-6 shadow-sm border border-emerald-50/70 dark:border-white/10 text-center flex flex-col items-center">
                   
                   {/* Circle Adjustable frame container */}
                   <div className="relative group">
@@ -1627,13 +1949,38 @@ export default function App() {
                     </label>
                   </div>
 
-                  <h2 className="font-serif text-[#0a3d1f] font-bold text-xl mt-5 mb-1">{currentUser.name}</h2>
+                  <h2 className="font-serif text-[#0a3d1f] dark:text-white font-bold text-xl mt-5 mb-1">{currentUser.name}</h2>
                   <span className="bg-emerald-50 text-emerald-800 px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wider mb-4 border border-emerald-100/30">
                     Verified {currentUser.role}
                   </span>
                   
                   <p className="text-gray-500 text-xs font-mono font-medium truncate w-full px-4 mb-2">{currentUser.email}</p>
-                  
+
+                  {/* Donor tier & progress badge */}
+                  {(() => {
+                    const t = tierFor(currentUser.totalContributed || 0);
+                    return (
+                      <div className="w-full mt-3 bg-gradient-to-br from-[#0a3d1f] to-[#145a32] rounded-xl p-4 text-white">
+                        <div className="flex items-center justify-center gap-2">
+                          <span className="text-2xl">{t.current.icon}</span>
+                          <span className="font-serif font-bold text-sm">{t.current.name}</span>
+                        </div>
+                        {t.next ? (
+                          <>
+                            <div className="w-full bg-white/15 rounded-full h-2 mt-3 overflow-hidden">
+                              <div className="bg-emerald-400 h-2 rounded-full transition-all duration-700" style={{ width: `${t.progress}%` }} />
+                            </div>
+                            <p className="text-[10px] text-emerald-200 mt-2 text-center">
+                              KES {((t.next.min) - (currentUser.totalContributed || 0)).toLocaleString()} more to reach {t.next.icon} {t.next.name}
+                            </p>
+                          </>
+                        ) : (
+                          <p className="text-[10px] text-emerald-200 mt-2 text-center">Highest tier reached — thank you for your generosity! 🎉</p>
+                        )}
+                      </div>
+                    );
+                  })()}
+
                   {/* Adjust photo trigger specifically */}
                   <div className="w-full pt-4 mt-4 border-t border-emerald-50 flex flex-col gap-2">
                     <label className="w-full text-center block bg-transparent border border-emerald-100 font-bold text-xs py-2 px-3 rounded-lg text-emerald-800 hover:bg-emerald-50 cursor-pointer select-none transition-all">
@@ -1668,13 +2015,13 @@ export default function App() {
                 <div className="lg:col-span-2 space-y-6">
                   
                   {/* Quick Overview Stewardship Summary */}
-                  <div className="bg-white rounded-2xl p-6 shadow-sm border border-emerald-50/70 space-y-4">
+                  <div className="bg-white dark:bg-[#13251c] rounded-2xl p-6 shadow-sm border border-emerald-50/70 dark:border-white/10 space-y-4">
                     <div className="flex items-center gap-2 text-[#0a3d1f]">
                       <Sparkles className="w-5 h-5 text-emerald-600" />
                       <h3 className="font-serif font-bold text-base">Verified Impact Statement</h3>
                     </div>
                     
-                    <p className="text-gray-600 text-xs leading-relaxed font-semibold">
+                    <p className="text-gray-600 dark:text-gray-300 text-xs leading-relaxed font-semibold">
                       Your contributions are aligned with zero-commission water and healthcare grids. No platform fees are withheld from grassroot organizations. We publish real-time ledger outputs matching local county registries.
                     </p>
 
@@ -1697,9 +2044,24 @@ export default function App() {
                     </div>
                   </div>
 
+                  {/* Personal Giving Insights */}
+                  {myContributions.length > 0 && (() => {
+                    const byCat: Record<string, number> = {};
+                    for (const c of myContributions) byCat[c.category] = (byCat[c.category] || 0) + c.amount;
+                    const data = Object.entries(byCat).map(([label, value]) => ({ label, value, color: categoryColor(label, darkMode) }));
+                    return (
+                      <div className="bg-white dark:bg-[#13251c] rounded-2xl p-6 shadow-sm border border-emerald-50/70 dark:border-white/10">
+                        <h3 className="font-serif font-bold text-[#0a3d1f] dark:text-white text-base border-b border-emerald-50 dark:border-white/10 pb-3 mb-5 flex items-center gap-2">
+                          <TrendingUp className="w-5 h-5 text-emerald-600" /> Your Giving Breakdown
+                        </h3>
+                        <DonutChart data={data} centerLabel="You gave" formatValue={(n) => formatKES(n)} />
+                      </div>
+                    );
+                  })()}
+
                   {/* Sample Mock Activity Log ledger table */}
-                  <div className="bg-white rounded-2xl p-6 shadow-sm border border-emerald-50/70">
-                    <h3 className="font-serif font-bold text-[#0a3d1f] text-base border-b border-emerald-50 pb-3 mb-4">
+                  <div className="bg-white dark:bg-[#13251c] rounded-2xl p-6 shadow-sm border border-emerald-50/70 dark:border-white/10">
+                    <h3 className="font-serif font-bold text-[#0a3d1f] dark:text-white text-base border-b border-emerald-50 dark:border-white/10 pb-3 mb-4">
                       My Contributions Ledger
                     </h3>
 
@@ -1717,7 +2079,7 @@ export default function App() {
                           <tbody className="divide-y divide-emerald-5/40 font-medium">
                             {myContributions.map((c) => (
                               <tr key={c.id} className="border-b border-emerald-50">
-                                <td className="py-3 text-gray-900 font-bold">{c.campaignTitle}</td>
+                                <td className="py-3 text-gray-900 dark:text-gray-100 font-bold">{c.campaignTitle}</td>
                                 <td className="py-3">
                                   <span className={`text-[10px] px-2 py-0.5 rounded-full ${
                                     c.category === 'Water' ? 'bg-blue-50 text-blue-800' :
@@ -1755,7 +2117,11 @@ export default function App() {
                           <h3 className="font-serif font-bold text-[#0a3d1f] text-base">My Campaigns</h3>
                         </div>
                         <button
-                          onClick={() => { setNcSuccess(false); setShowStartCampaignModal(true); }}
+                          onClick={() => {
+                            setEditingCampaignId(null);
+                            setNcTitle(''); setNcOrg(''); setNcDesc(''); setNcShort(''); setNcTarget('300000');
+                            setNcSuccess(false); setShowStartCampaignModal(true);
+                          }}
                           className="bg-emerald-500 hover:bg-emerald-400 text-white text-xs font-bold py-1.5 px-3 rounded-lg flex items-center gap-1 cursor-pointer"
                         >
                           <Plus className="w-3.5 h-3.5" /> New
@@ -1768,9 +2134,16 @@ export default function App() {
                             <div key={c.id} className="flex items-center gap-3 p-3 rounded-xl border border-emerald-50 hover:border-emerald-100 transition-colors">
                               <div className="w-10 h-10 rounded-lg flex items-center justify-center text-xl shrink-0" style={{ backgroundColor: c.color }}>{c.icon}</div>
                               <div className="flex-1 min-w-0">
-                                <button onClick={() => { setSelectedCampaignId(c.id); setDonationSuccess(false); setActivePage('detail'); }} className="font-bold text-xs text-gray-900 truncate hover:text-emerald-700 text-left w-full cursor-pointer">{c.title}</button>
+                                <button onClick={() => { setSelectedCampaignId(c.id); setDonationSuccess(false); setActivePage('detail'); }} className="font-bold text-xs text-gray-900 dark:text-white truncate hover:text-emerald-700 text-left w-full cursor-pointer">{c.title}</button>
                                 <div className="text-[10px] text-gray-500 mt-0.5">KES {c.raised.toLocaleString()} raised · {c.donors} donors · {Math.round((c.raised / c.target) * 100)}% funded</div>
                               </div>
+                              <button
+                                onClick={() => handleOpenEditCampaign(c)}
+                                title="Edit campaign"
+                                className="text-emerald-600 hover:text-white hover:bg-emerald-500 p-2 rounded-lg transition-colors cursor-pointer shrink-0"
+                              >
+                                <Pencil className="w-4 h-4" />
+                              </button>
                               <button
                                 onClick={() => handleDeleteCampaign(c)}
                                 title="Delete campaign"
@@ -1819,6 +2192,31 @@ export default function App() {
                         </div>
                       </div>
 
+                      {/* Admin analytics charts */}
+                      {analytics && (
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                          <div className="bg-white dark:bg-[#13251c] rounded-2xl p-6 shadow-sm border border-emerald-50/70 dark:border-white/10">
+                            <h3 className="font-serif font-bold text-[#0a3d1f] dark:text-white text-base mb-4">Raised by Category</h3>
+                            <DonutChart
+                              size={170} thickness={22}
+                              data={analytics.byCategory.map((c: any) => ({ label: c.label, value: c.value, color: categoryColor(c.label, darkMode) }))}
+                              centerLabel="Raised"
+                              formatValue={(n) => formatKES(n)}
+                            />
+                          </div>
+                          <div className="bg-white dark:bg-[#13251c] rounded-2xl p-6 shadow-sm border border-emerald-50/70 dark:border-white/10">
+                            <h3 className="font-serif font-bold text-[#0a3d1f] dark:text-white text-base mb-4">Donations Over Time</h3>
+                            <AreaChart
+                              height={170}
+                              points={analytics.overTime.map((p: any) => ({ label: p.date, value: p.amount }))}
+                              color={darkMode ? '#34d399' : '#10b981'}
+                              formatValue={(n) => formatKES(n)}
+                              formatLabel={(s) => new Date(s).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                            />
+                          </div>
+                        </div>
+                      )}
+
                       {/* Manage all campaigns */}
                       <div className="bg-white rounded-2xl p-6 shadow-sm border border-emerald-50/70">
                         <h3 className="font-serif font-bold text-[#0a3d1f] text-base border-b border-emerald-50 pb-3 mb-4 flex items-center gap-2">
@@ -1829,9 +2227,12 @@ export default function App() {
                             <div key={c.id} className="flex items-center gap-3 p-2.5 rounded-xl border border-emerald-50">
                               <div className="w-9 h-9 rounded-lg flex items-center justify-center text-lg shrink-0" style={{ backgroundColor: c.color }}>{c.icon}</div>
                               <div className="flex-1 min-w-0">
-                                <div className="font-bold text-xs text-gray-900 truncate">{c.title}</div>
+                                <div className="font-bold text-xs text-gray-900 dark:text-white truncate">{c.title}</div>
                                 <div className="text-[10px] text-gray-500">{c.org}{c.ownerEmail ? ` · ${c.ownerEmail}` : ' · platform'}</div>
                               </div>
+                              <button onClick={() => handleOpenEditCampaign(c)} title="Edit campaign" className="text-emerald-600 hover:text-white hover:bg-emerald-500 p-2 rounded-lg transition-colors cursor-pointer shrink-0">
+                                <Pencil className="w-4 h-4" />
+                              </button>
                               <button onClick={() => handleDeleteCampaign(c)} title="Delete campaign" className="text-red-500 hover:text-white hover:bg-red-500 p-2 rounded-lg transition-colors cursor-pointer shrink-0">
                                 <Trash2 className="w-4 h-4" />
                               </button>
@@ -1875,7 +2276,7 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <div className="bg-white p-12 text-center rounded-xl max-w-lg mx-auto border border-emerald-50">
+              <div className="bg-white dark:bg-[#13251c] p-12 text-center rounded-xl max-w-lg mx-auto border border-emerald-50 dark:border-white/10">
                 <p className="text-gray-500 text-sm mb-4">Please log in to inspect your secure stewardship log.</p>
                 <button 
                   onClick={() => {
@@ -1888,6 +2289,152 @@ export default function App() {
                 </button>
               </div>
             )}
+          </div>
+        )}
+
+        {/* 6. IMPACT ANALYTICS DASHBOARD */}
+        {activePage === 'analytics' && (
+          <div className="w-full flex flex-col anim-fade-in">
+            {/* Header */}
+            <section className="bg-gradient-to-br from-[#0a3d1f] via-[#145a32] to-[#1a7340] text-white py-12 px-4 md:px-8">
+              <div className="max-w-7xl mx-auto">
+                <div className="inline-flex items-center gap-1.5 bg-emerald-800/50 border border-emerald-500/20 rounded-full px-4 py-1.5 text-xs font-bold text-emerald-300 uppercase tracking-widest mb-4">
+                  <BarChart3 className="w-4 h-4" /> Live Transparency Analytics
+                </div>
+                <h1 className="font-serif text-3xl md:text-4xl font-bold">Impact & Insights Dashboard</h1>
+                <p className="text-emerald-100/90 text-sm mt-2 max-w-2xl">Real-time, aggregated data across every verified campaign — the same numbers our compliance team publishes.</p>
+              </div>
+            </section>
+
+            <section className="max-w-7xl mx-auto px-4 md:px-8 py-10 w-full space-y-8">
+              {analytics ? (
+                <>
+                  {/* KPI tiles */}
+                  <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+                    {[
+                      { label: 'Total Raised', value: formatKES(analytics.totals.raised), icon: <TrendingUp className="w-5 h-5" /> },
+                      { label: 'Contributions', value: analytics.totals.contributions.toLocaleString(), icon: <Heart className="w-5 h-5" /> },
+                      { label: 'Active Campaigns', value: analytics.totals.campaigns, icon: <Layers className="w-5 h-5" /> },
+                      { label: 'Registered Donors', value: analytics.totals.users.toLocaleString(), icon: <Users2 className="w-5 h-5" /> },
+                    ].map((k, i) => (
+                      <div key={i} className="bg-white dark:bg-[#13251c] rounded-2xl p-5 shadow-sm border border-emerald-50 dark:border-white/10">
+                        <div className="flex items-center justify-between">
+                          <span className="text-emerald-600 dark:text-emerald-400">{k.icon}</span>
+                          <span className="text-[9px] font-bold uppercase tracking-wider text-gray-400">{k.label}</span>
+                        </div>
+                        <div className="text-2xl md:text-3xl font-black text-[#0a3d1f] dark:text-white mt-3">{k.value}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Row: category donut + top campaigns */}
+                  <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <div className="bg-white dark:bg-[#13251c] rounded-2xl p-6 shadow-sm border border-emerald-50 dark:border-white/10">
+                      <h3 className="font-serif font-bold text-[#0a3d1f] dark:text-white text-base mb-5">Funds Raised by Category</h3>
+                      <DonutChart
+                        data={analytics.byCategory.map((c: any) => ({ label: c.label, value: c.value, color: categoryColor(c.label, darkMode) }))}
+                        centerLabel="Raised"
+                        formatValue={(n) => formatKES(n)}
+                      />
+                    </div>
+                    <div className="bg-white dark:bg-[#13251c] rounded-2xl p-6 shadow-sm border border-emerald-50 dark:border-white/10">
+                      <h3 className="font-serif font-bold text-[#0a3d1f] dark:text-white text-base mb-5">Top Campaigns</h3>
+                      <HBarChart
+                        data={analytics.topCampaigns.map((c: any) => ({
+                          label: `${c.icon} ${c.title}`,
+                          value: c.raised,
+                          sub: `${Math.round((c.raised / c.target) * 100)}% of ${formatKES(c.target)} goal`,
+                          color: '#10b981'
+                        }))}
+                        formatValue={(n) => formatKES(n)}
+                      />
+                    </div>
+                  </div>
+
+                  {/* Row: donations over time */}
+                  <div className="bg-white dark:bg-[#13251c] rounded-2xl p-6 shadow-sm border border-emerald-50 dark:border-white/10">
+                    <h3 className="font-serif font-bold text-[#0a3d1f] dark:text-white text-base mb-5">Donations Over Time</h3>
+                    <AreaChart
+                      points={analytics.overTime.map((p: any) => ({ label: p.date, value: p.amount }))}
+                      color={darkMode ? '#34d399' : '#10b981'}
+                      formatValue={(n) => formatKES(n)}
+                      formatLabel={(s) => new Date(s).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}
+                    />
+                  </div>
+
+                  {/* Row: leaderboard + payment split + live feed */}
+                  <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                    {/* Leaderboard */}
+                    <div className="bg-white dark:bg-[#13251c] rounded-2xl p-6 shadow-sm border border-emerald-50 dark:border-white/10">
+                      <h3 className="font-serif font-bold text-[#0a3d1f] dark:text-white text-base mb-4 flex items-center gap-2">
+                        <Trophy className="w-5 h-5 text-amber-500" /> Top Donors
+                      </h3>
+                      {leaderboard.length > 0 ? (
+                        <div className="space-y-2.5">
+                          {leaderboard.slice(0, 6).map((u: any, i: number) => (
+                            <div key={i} className="flex items-center gap-3">
+                              <span className={`w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-black shrink-0 ${
+                                i === 0 ? 'bg-amber-100 text-amber-700' : i === 1 ? 'bg-gray-200 text-gray-600' : i === 2 ? 'bg-orange-100 text-orange-700' : 'bg-emerald-50 text-emerald-700 dark:bg-white/10 dark:text-emerald-300'
+                              }`}>{i < 3 ? ['🥇', '🥈', '🥉'][i] : i + 1}</span>
+                              <div className="w-7 h-7 rounded-full bg-emerald-100 dark:bg-white/10 overflow-hidden flex items-center justify-center text-xs font-bold text-emerald-800 dark:text-emerald-300 shrink-0">
+                                {u.photoUrl ? <img src={u.photoUrl} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" /> : u.name.charAt(0).toUpperCase()}
+                              </div>
+                              <div className="flex-1 min-w-0">
+                                <div className="text-xs font-bold text-gray-900 dark:text-white truncate">{u.name}</div>
+                                <div className="text-[10px] text-gray-400">{u.tier?.icon} {u.tier?.name}</div>
+                              </div>
+                              <span className="text-xs font-bold text-emerald-700 dark:text-emerald-400 tabular-nums shrink-0">{formatKES(u.totalContributed)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-xs text-gray-400 py-6 text-center">No donors ranked yet.</p>
+                      )}
+                    </div>
+
+                    {/* Payment method split */}
+                    <div className="bg-white dark:bg-[#13251c] rounded-2xl p-6 shadow-sm border border-emerald-50 dark:border-white/10">
+                      <h3 className="font-serif font-bold text-[#0a3d1f] dark:text-white text-base mb-4">Payment Methods</h3>
+                      <DonutChart
+                        size={160}
+                        thickness={22}
+                        data={analytics.byMethod.map((m: any, i: number) => ({ label: m.label, value: m.value, color: methodColors[i % methodColors.length] }))}
+                        centerLabel="Payments"
+                        formatValue={(n) => `${n}`}
+                      />
+                    </div>
+
+                    {/* Live activity feed */}
+                    <div className="bg-white dark:bg-[#13251c] rounded-2xl p-6 shadow-sm border border-emerald-50 dark:border-white/10">
+                      <h3 className="font-serif font-bold text-[#0a3d1f] dark:text-white text-base mb-4 flex items-center gap-2">
+                        <span className="relative flex h-2.5 w-2.5">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                          <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500" />
+                        </span>
+                        Live Activity
+                      </h3>
+                      <div className="space-y-3 max-h-72 overflow-y-auto pr-1">
+                        {activityFeed.length > 0 ? activityFeed.map((a: any, i: number) => (
+                          <div key={i} className="flex items-start gap-2.5">
+                            <span className="w-6 h-6 rounded-full flex items-center justify-center text-xs shrink-0" style={{ backgroundColor: `${categoryColor(a.category, darkMode)}22` }}>
+                              <Heart className="w-3 h-3" style={{ color: categoryColor(a.category, darkMode) }} />
+                            </span>
+                            <div className="min-w-0 flex-1">
+                              <p className="text-xs text-gray-700 dark:text-gray-200 leading-snug">
+                                <strong className="text-gray-900 dark:text-white">{a.donorName}</strong> gave <strong className="text-emerald-700 dark:text-emerald-400">{formatKES(a.amount)}</strong> to <span className="font-semibold">{a.campaignTitle}</span>
+                              </p>
+                              <span className="text-[10px] text-gray-400">{timeAgo(a.timestamp)} · {a.paymentMethod}</span>
+                            </div>
+                          </div>
+                        )) : <p className="text-xs text-gray-400 py-6 text-center">No recent activity.</p>}
+                      </div>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="py-20 text-center text-gray-400 text-sm">Loading analytics…</div>
+              )}
+            </section>
           </div>
         )}
 
@@ -1907,6 +2454,9 @@ export default function App() {
           </div>
         </div>
       </footer>
+
+      {/* ── CONFETTI CELEBRATION ── */}
+      {showConfetti && <Confetti />}
 
       {/* ── TOAST NOTIFICATION ── */}
       <AnimatePresence>
@@ -1951,8 +2501,8 @@ export default function App() {
                     <Plus className="w-5 h-5 text-emerald-400" />
                   </div>
                   <div>
-                    <h3 className="font-serif text-lg font-bold">Launch a Verified Campaign</h3>
-                    <p className="text-emerald-300 text-[10px] font-semibold">Zero application or operational fees on CharityLink Kenya</p>
+                    <h3 className="font-serif text-lg font-bold">{editingCampaignId !== null ? 'Edit Campaign' : 'Launch a Verified Campaign'}</h3>
+                    <p className="text-emerald-300 text-[10px] font-semibold">{editingCampaignId !== null ? 'Update the details of your campaign' : 'Zero application or operational fees on CharityLink Kenya'}</p>
                   </div>
                 </div>
                 <button 
@@ -1989,8 +2539,8 @@ export default function App() {
                     </button>
                   </div>
                 ) : (
-                  <form onSubmit={handleCreateCampaign} className="space-y-5">
-                    
+                  <form onSubmit={editingCampaignId !== null ? handleUpdateCampaign : handleCreateCampaign} className="space-y-5">
+
                     {/* Two Col Group */}
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       {/* Organization Name */}
@@ -2033,10 +2583,30 @@ export default function App() {
                       />
                     </div>
 
+                    {/* AI copywriter assist */}
+                    <div className="flex items-center justify-between gap-3 bg-gradient-to-r from-emerald-50 to-blue-50 border border-emerald-100 rounded-xl px-4 py-3">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <Wand2 className="w-5 h-5 text-emerald-600 shrink-0" />
+                        <div className="min-w-0">
+                          <p className="text-xs font-bold text-emerald-900">AI Campaign Assistant</p>
+                          <p className="text-[10px] text-gray-500 truncate">Type a short idea above, then auto-draft the full description.</p>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleGenerateCopy}
+                        disabled={aiCopyLoading}
+                        className="shrink-0 bg-[#0a3d1f] hover:bg-[#145a32] text-white text-xs font-bold py-2 px-3.5 rounded-lg flex items-center gap-1.5 disabled:opacity-50 cursor-pointer transition-all"
+                      >
+                        {aiCopyLoading ? <Activity className="w-4 h-4 animate-pulse" /> : <Sparkles className="w-4 h-4" />}
+                        {aiCopyLoading ? 'Writing…' : 'Generate'}
+                      </button>
+                    </div>
+
                     {/* Full Breakdown Desc */}
                     <div>
                       <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">Full Campaign Context & Impact Needs</label>
-                      <textarea 
+                      <textarea
                         required
                         rows={4}
                         placeholder="Detail why funding this project matters, what local county challenges this fixes, and your transparent implementation milestones."
@@ -2115,11 +2685,11 @@ export default function App() {
                         <ShieldCheck className="w-4 h-4 text-emerald-600" />
                         <span>Requires community audit within 48 hours</span>
                       </div>
-                      <button 
+                      <button
                         type="submit"
                         className="bg-[#0a3d1f] hover:bg-[#145a32] text-white font-bold text-xs py-2.5 px-6 rounded-xl shadow-md transition-all cursor-pointer"
                       >
-                        Publish Verified Campaign
+                        {editingCampaignId !== null ? 'Save Changes' : 'Publish Verified Campaign'}
                       </button>
                     </div>
 
@@ -2175,7 +2745,7 @@ export default function App() {
               <div className="p-6 md:p-8 space-y-6">
                 
                 {/* Intro paragraph */}
-                <p className="text-gray-600 text-xs leading-relaxed font-semibold">
+                <p className="text-gray-600 dark:text-gray-300 text-xs leading-relaxed font-semibold">
                   We designed a trust system to clear out the opacity of typical NGO organizations. Through physical audits and direct transaction tracking, your money behaves like a direct cash injection.
                 </p>
 
@@ -2535,10 +3105,16 @@ export default function App() {
                     : 'Log in before donating to track contributions in your personal ledger.'}
                 </p>
 
-                <div className="flex gap-2 mt-5">
+                <button
+                  onClick={downloadReceipt}
+                  className="w-full mt-5 border border-emerald-200 text-emerald-800 hover:bg-emerald-50 text-xs font-bold py-2.5 rounded-xl transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <Download className="w-4 h-4" /> Download Receipt
+                </button>
+                <div className="flex gap-2 mt-2">
                   <button
                     onClick={() => setShowReceiptModal(false)}
-                    className="flex-1 border border-emerald-200 text-emerald-800 hover:bg-emerald-50 text-xs font-bold py-2.5 rounded-xl transition-colors cursor-pointer"
+                    className="flex-1 border border-gray-200 text-gray-600 hover:bg-gray-50 text-xs font-bold py-2.5 rounded-xl transition-colors cursor-pointer"
                   >
                     Close
                   </button>
@@ -2591,5 +3167,38 @@ function FolderHeart(props: React.SVGProps<SVGSVGElement>) {
       <path d="M11 20H4a2 2 0 0 1-2-2V5c0-1.1.9-2 2-2h3.93a2 2 0 0 1 1.66.9l.82 1.2a2 2 0 0 0 1.66.9H20a2 2 0 0 1 2 2v2.5" />
       <path d="M19 14c1.49-1.46 3-1.46 4.5 0 1.5 1.46 0 3.5-3 5.5-3-2-4.5-4.04-3-5.5z" />
     </svg>
+  );
+}
+
+// Lightweight confetti burst — self-contained, no dependencies.
+function Confetti() {
+  const colors = ['#2ecc71', '#10b981', '#f59e0b', '#3b82f6', '#ef4444', '#a855f7', '#eab308'];
+  const pieces = Array.from({ length: 70 }, (_, i) => {
+    const left = Math.random() * 100;
+    const delay = Math.random() * 0.6;
+    const duration = 2.4 + Math.random() * 1.6;
+    const size = 6 + Math.random() * 8;
+    const color = colors[i % colors.length];
+    const rounded = Math.random() > 0.5;
+    return (
+      <span
+        key={i}
+        style={{
+          position: 'absolute',
+          top: 0,
+          left: `${left}%`,
+          width: `${size}px`,
+          height: `${size * (rounded ? 1 : 0.5)}px`,
+          backgroundColor: color,
+          borderRadius: rounded ? '50%' : '2px',
+          animation: `confetti-fall ${duration}s ${delay}s linear forwards`,
+        }}
+      />
+    );
+  });
+  return (
+    <div className="fixed inset-0 pointer-events-none z-[10001] overflow-hidden" aria-hidden="true">
+      {pieces}
+    </div>
   );
 }

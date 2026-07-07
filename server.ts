@@ -394,6 +394,95 @@ async function resolveRequester(req: any): Promise<UserRecord | null> {
   return getUserByEmail(String(email));
 }
 
+// Returns a full read snapshot of the active store (MySQL or JSON), used by the
+// public analytics / activity / leaderboard endpoints.
+async function snapshot(): Promise<DatabaseSchema> {
+  try {
+    if (isUsingMySQL && pool) {
+      const [c]: any = await pool.query("SELECT * FROM campaigns");
+      const campaigns = c.map((row: any) => ({
+        ...row,
+        verified: Boolean(row.verified),
+        impact: JSON.parse(row.impact)
+      }));
+      const [u]: any = await pool.query("SELECT * FROM users");
+      const [ct]: any = await pool.query("SELECT * FROM contributions");
+      return { campaigns, users: u, contributions: ct };
+    }
+  } catch (err) {
+    console.error("snapshot error:", err);
+  }
+  return loadDB();
+}
+
+// Donor giving tiers, shared so the API and UI agree on thresholds.
+const GIVING_TIERS = [
+  { name: "Seedling", min: 0, icon: "🌱" },
+  { name: "Bronze Guardian", min: 5000, icon: "🥉" },
+  { name: "Silver Guardian", min: 25000, icon: "🥈" },
+  { name: "Gold Guardian", min: 75000, icon: "🥇" },
+  { name: "Platinum Guardian", min: 200000, icon: "💎" }
+];
+
+function tierFor(total: number) {
+  let current = GIVING_TIERS[0];
+  for (const t of GIVING_TIERS) if (total >= t.min) current = t;
+  const idx = GIVING_TIERS.indexOf(current);
+  const next = GIVING_TIERS[idx + 1] || null;
+  return { current, next };
+}
+
+// --- AI (Gemini) with graceful local fallback ---
+// Calls Gemini when GEMINI_API_KEY is configured; returns null otherwise so
+// callers can fall back to a deterministic local generator (keeps the demo
+// working with no API key).
+async function callGemini(prompt: string): Promise<string | null> {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key || key === "MY_GEMINI_API_KEY") return null;
+  try {
+    const { GoogleGenAI } = await import("@google/genai");
+    const ai = new GoogleGenAI({ apiKey: key });
+    const resp: any = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: prompt
+    });
+    return resp?.text ?? null;
+  } catch (err) {
+    console.error("Gemini call failed, using fallback:", err);
+    return null;
+  }
+}
+
+function localCampaignCopy(idea: string, category: string, org: string) {
+  const cleanIdea = idea.trim().replace(/\.$/, "");
+  const orgName = org || "Our organisation";
+  const cat = (category || "community").toLowerCase();
+  const short = `${cleanIdea} — a verified ${cat} initiative mobilising transparent support for communities across Kenya.`;
+  const desc =
+    `${orgName} is launching this ${cat} campaign to address a pressing local need: ${cleanIdea}. ` +
+    `Every shilling contributed is tracked in real time and disbursed in verified increments, so donors can see exactly how their support translates into on-the-ground impact. ` +
+    `Working alongside county partners and independent field volunteers, we register coordinates, document delivery, and publish progress openly. ` +
+    `Your contribution helps us reach more households, accelerate implementation, and build lasting change grounded in accountability and trust.`;
+  const usage = "85% goes directly to field implementation and materials, 10% to verified logistics and monitoring, and 5% to community coordination and transparent reporting.";
+  return { short, desc, usage, source: "template" as const };
+}
+
+function localImpact(amount: number, campaignTitle: string, category: string) {
+  const cat = (category || "").toLowerCase();
+  const perUnit: Record<string, { unit: string; cost: number }> = {
+    water: { unit: "a day of clean water for pupils", cost: 100 },
+    education: { unit: "a week of tuition support", cost: 500 },
+    health: { unit: "a maternal check-up", cost: 800 },
+    livelihood: { unit: "a day of agri-business training", cost: 600 },
+    emergency: { unit: "an emergency food parcel", cost: 1000 },
+    environment: { unit: "indigenous tree seedlings planted", cost: 50 }
+  };
+  const spec = perUnit[cat] || { unit: "units of verified support", cost: 300 };
+  const units = Math.max(1, Math.round(amount / spec.cost));
+  const text = `Your KES ${amount.toLocaleString()} to “${campaignTitle}” provides roughly ${units.toLocaleString()} ${spec.unit} — a direct, verified contribution to lasting local impact.`;
+  return { text, source: "template" as const };
+}
+
 // Shared donation-recording logic used by both the direct /donate endpoint
 // and the M-Pesa STK callback, so campaign/contribution/user updates only
 // live in one place. Behavior is identical to the previous inline copies.
@@ -688,6 +777,71 @@ async function startServer() {
     res.json({ success: true, id: campaignId });
   });
 
+  // Edit a campaign (admin: any; organisation: only its own).
+  app.put("/api/campaigns/:id", async (req, res) => {
+    const campaignId = Number(req.params.id);
+    const requester = await resolveRequester(req);
+    if (!requester) {
+      return res.status(401).json({ error: "You must be logged in to edit a campaign." });
+    }
+
+    const { title, org, desc, short, target, category, icon, color } = req.body;
+    const isOwnerOf = (owner?: string) => !!owner && owner.toLowerCase() === requester.email.toLowerCase();
+
+    const authorize = (owner?: string) =>
+      requester.role === "admin" || (requester.role === "organisation" && isOwnerOf(owner));
+
+    try {
+      if (isUsingMySQL && pool) {
+        const [rows]: any = await pool.query("SELECT * FROM campaigns WHERE id = ?", [campaignId]);
+        const existing = rows?.[0];
+        if (!existing) return res.status(404).json({ error: "Campaign not found." });
+        if (!authorize(existing.ownerEmail)) return res.status(403).json({ error: "You do not have permission to edit this campaign." });
+
+        await pool.query(
+          "UPDATE campaigns SET title = ?, org = ?, `desc` = ?, short = ?, target = ?, category = ?, icon = ?, color = ? WHERE id = ?",
+          [
+            title ?? existing.title,
+            org ?? existing.org,
+            desc ?? existing.desc,
+            short ?? existing.short,
+            target ? Number(target) : existing.target,
+            category ?? existing.category,
+            icon ?? existing.icon,
+            color ?? existing.color,
+            campaignId
+          ]
+        );
+        const [updatedRows]: any = await pool.query("SELECT * FROM campaigns WHERE id = ?", [campaignId]);
+        const updated = updatedRows[0];
+        updated.verified = Boolean(updated.verified);
+        updated.impact = JSON.parse(updated.impact);
+        return res.json(updated);
+      }
+    } catch (err) {
+      console.error("MySQL update error in PUT /api/campaigns/:id:", err);
+    }
+
+    const db = loadDB();
+    const idx = db.campaigns.findIndex(c => c.id === campaignId);
+    if (idx === -1) return res.status(404).json({ error: "Campaign not found." });
+    if (!authorize(db.campaigns[idx].ownerEmail)) return res.status(403).json({ error: "You do not have permission to edit this campaign." });
+
+    db.campaigns[idx] = {
+      ...db.campaigns[idx],
+      title: title ?? db.campaigns[idx].title,
+      org: org ?? db.campaigns[idx].org,
+      desc: desc ?? db.campaigns[idx].desc,
+      short: short ?? db.campaigns[idx].short,
+      target: target ? Number(target) : db.campaigns[idx].target,
+      category: category ?? db.campaigns[idx].category,
+      icon: icon ?? db.campaigns[idx].icon,
+      color: color ?? db.campaigns[idx].color
+    };
+    saveDB(db);
+    res.json(db.campaigns[idx]);
+  });
+
   // Log in user
   app.post("/api/auth/login", async (req, res) => {
     const { email, password } = req.body;
@@ -884,6 +1038,142 @@ async function startServer() {
     }
     const db = loadDB();
     res.json([...db.contributions].reverse());
+  });
+
+  // --- PUBLIC ANALYTICS (aggregated, no personal data) ---
+  app.get("/api/analytics", async (req, res) => {
+    const { campaigns, contributions, users } = await snapshot();
+
+    const totalRaised = campaigns.reduce((s, c) => s + (c.raised || 0), 0);
+    const totalDonors = campaigns.reduce((s, c) => s + (c.donors || 0), 0);
+
+    // Funds raised per category (from campaign totals).
+    const byCategoryMap: Record<string, number> = {};
+    for (const c of campaigns) byCategoryMap[c.category] = (byCategoryMap[c.category] || 0) + (c.raised || 0);
+    const byCategory = Object.entries(byCategoryMap).map(([label, value]) => ({ label, value }));
+
+    // Top campaigns by amount raised.
+    const topCampaigns = [...campaigns]
+      .sort((a, b) => b.raised - a.raised)
+      .slice(0, 6)
+      .map(c => ({ title: c.title, raised: c.raised, target: c.target, icon: c.icon, color: c.color }));
+
+    // Donations over time (grouped by calendar day).
+    const byDayMap: Record<string, number> = {};
+    for (const ct of contributions) {
+      const day = (ct.timestamp || "").slice(0, 10);
+      if (!day) continue;
+      byDayMap[day] = (byDayMap[day] || 0) + (ct.amount || 0);
+    }
+    const overTime = Object.entries(byDayMap)
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([date, amount]) => ({ date, amount }));
+
+    // Payment-method split.
+    const byMethodMap: Record<string, number> = {};
+    for (const ct of contributions) byMethodMap[ct.paymentMethod || "Other"] = (byMethodMap[ct.paymentMethod || "Other"] || 0) + 1;
+    const byMethod = Object.entries(byMethodMap).map(([label, value]) => ({ label, value }));
+
+    res.json({
+      totals: {
+        raised: totalRaised,
+        donors: totalDonors,
+        campaigns: campaigns.length,
+        contributions: contributions.length,
+        users: users.length,
+        verifiedPct: campaigns.length ? Math.round((campaigns.filter(c => c.verified).length / campaigns.length) * 100) : 100
+      },
+      byCategory,
+      topCampaigns,
+      overTime,
+      byMethod
+    });
+  });
+
+  // --- LIVE ACTIVITY FEED (recent contributions, first names only) ---
+  app.get("/api/activity", async (req, res) => {
+    const limit = Math.min(Number(req.query.limit) || 15, 50);
+    const { contributions } = await snapshot();
+    const recent = [...contributions]
+      .sort((a, b) => (b.timestamp || "").localeCompare(a.timestamp || ""))
+      .slice(0, limit)
+      .map(c => ({
+        donorName: (c.donorName || "Anonymous").split(" ")[0],
+        amount: c.amount,
+        campaignTitle: c.campaignTitle,
+        category: c.category,
+        paymentMethod: c.paymentMethod,
+        timestamp: c.timestamp
+      }));
+    res.json(recent);
+  });
+
+  // --- TOP DONORS LEADERBOARD ---
+  app.get("/api/leaderboard", async (req, res) => {
+    const { users } = await snapshot();
+    const top = [...users]
+      .filter(u => (u.totalContributed || 0) > 0)
+      .sort((a, b) => (b.totalContributed || 0) - (a.totalContributed || 0))
+      .slice(0, 10)
+      .map(u => ({
+        name: u.name,
+        photoUrl: u.photoUrl || "",
+        totalContributed: u.totalContributed || 0,
+        campaignsSupported: u.campaignsSupported || 0,
+        tier: tierFor(u.totalContributed || 0).current
+      }));
+    res.json(top);
+  });
+
+  // --- AI: CAMPAIGN COPYWRITER ---
+  // Turns a one-line idea into a full description, short pitch and fund-usage
+  // breakdown. Uses Gemini if configured, else a deterministic local generator.
+  app.post("/api/ai/campaign-copy", async (req, res) => {
+    const { idea, category, org } = req.body as { idea?: string; category?: string; org?: string };
+    if (!idea || !idea.trim()) {
+      return res.status(400).json({ error: "Please provide a short idea for your campaign." });
+    }
+
+    const prompt =
+      `You are a fundraising copywriter for a Kenyan charity platform called CharityLink. ` +
+      `Given this campaign idea: "${idea}" (category: ${category || "community"}, organisation: ${org || "an NGO"}), ` +
+      `write compelling, credible copy. Respond ONLY with strict minified JSON with exactly these keys: ` +
+      `"short" (one punchy sentence, max 160 chars), "desc" (2-3 vivid paragraphs, ~120 words), ` +
+      `"usage" (one sentence describing the percentage fund allocation). No markdown, no extra text.`;
+
+    const raw = await callGemini(prompt);
+    if (raw) {
+      try {
+        const jsonText = raw.replace(/```json/gi, "").replace(/```/g, "").trim();
+        const parsed = JSON.parse(jsonText);
+        if (parsed.short && parsed.desc && parsed.usage) {
+          return res.json({ short: parsed.short, desc: parsed.desc, usage: parsed.usage, source: "ai" });
+        }
+      } catch {
+        // fall through to local generator
+      }
+    }
+    res.json(localCampaignCopy(idea, category || "", org || ""));
+  });
+
+  // --- AI: DONATION IMPACT EXPLAINER ---
+  app.post("/api/ai/impact", async (req, res) => {
+    const { amount, campaignTitle, category } = req.body as { amount?: number; campaignTitle?: string; category?: string };
+    const amt = Number(amount);
+    if (!amt || amt <= 0 || !campaignTitle) {
+      return res.status(400).json({ error: "amount and campaignTitle are required." });
+    }
+
+    const prompt =
+      `In ONE encouraging sentence (max 30 words, no markdown), tell a donor the tangible impact of giving ` +
+      `KES ${amt} to the Kenyan charity campaign "${campaignTitle}" (category: ${category || "community"}). ` +
+      `Be concrete and realistic.`;
+
+    const raw = await callGemini(prompt);
+    if (raw && raw.trim()) {
+      return res.json({ text: raw.trim().replace(/^["']|["']$/g, ""), source: "ai" });
+    }
+    res.json(localImpact(amt, campaignTitle, category || ""));
   });
 
   // Submit donation

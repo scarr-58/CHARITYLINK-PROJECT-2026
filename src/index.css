@@ -1,7 +1,20 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:wght@700&display=swap');
 @import "tailwindcss";
 
+/* Enable class-based dark mode: `dark:` utilities apply when a `.dark`
+   ancestor is present (we toggle `.dark` on <html>). */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-serif: "Playfair Display", ui-serif, Georgia, serif;
+}
+
+/* Smooth theme transition for large surfaces */
+html.dark { color-scheme: dark; }
+
+/* Confetti celebration */
+@keyframes confetti-fall {
+  0%   { transform: translateY(-12vh) rotate(0deg); opacity: 1; }
+  100% { transform: translateY(110vh) rotate(720deg); opacity: 0.85; }
 }
