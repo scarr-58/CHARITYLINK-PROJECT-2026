@@ -18,6 +18,7 @@ export interface Campaign {
   impact: ImpactItem[];
   usage: string;
   color: string;
+  ownerEmail?: string;
 }
 
 export type UserRole = 'donor' | 'organisation' | 'admin';

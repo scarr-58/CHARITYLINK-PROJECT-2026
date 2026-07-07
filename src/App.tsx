@@ -25,7 +25,10 @@ import {
   HelpCircle,
   Send,
   Check,
-  Activity
+  Activity,
+  Trash2,
+  Users2,
+  ShieldAlert
 } from 'lucide-react';
 import { Campaign, User, UserRole, ImpactItem } from './types';
 import { INITIAL_CAMPAIGNS, CATEGORIES } from './data';
@@ -112,6 +115,19 @@ export default function App() {
   const [qdIsLoading, setQdIsLoading] = useState<boolean>(false);
   const [qdSuccess, setQdSuccess] = useState<boolean>(false);
 
+  // Registration admin access code (only required when registering as admin)
+  const [registerAdminCode, setRegisterAdminCode] = useState<string>('');
+
+  // Records the last completed donation so success screens show the real
+  // amount/campaign even after the input fields are cleared.
+  const [lastDonation, setLastDonation] = useState<{ amount: number; campaignTitle: string; method: string } | null>(null);
+  // Controls the donation receipt popup shown after a successful contribution.
+  const [showReceiptModal, setShowReceiptModal] = useState<boolean>(false);
+
+  // Admin dashboard data
+  const [adminUsers, setAdminUsers] = useState<any[]>([]);
+  const [adminContributions, setAdminContributions] = useState<any[]>([]);
+
   // Error States
   const [errors, setErrors] = useState<{ [key: string]: string }>({});
 
@@ -155,8 +171,13 @@ export default function App() {
   useEffect(() => {
     if (currentUser) {
       fetchMyContributions(currentUser.email);
+      if (currentUser.role === 'admin') {
+        fetchAdminData();
+      }
     } else {
       setMyContributions([]);
+      setAdminUsers([]);
+      setAdminContributions([]);
     }
   }, [currentUser]);
 
@@ -209,6 +230,11 @@ export default function App() {
       return;
     }
 
+    if (!currentUser || !canCreateCampaign) {
+      triggerToast("Only organisation or admin accounts can launch campaigns.");
+      return;
+    }
+
     try {
       const res = await fetch('/api/campaigns', {
         method: 'POST',
@@ -221,7 +247,9 @@ export default function App() {
           target: targetNum,
           category: ncCategory,
           icon: ncIcon,
-          color: ncColor
+          color: ncColor,
+          requesterEmail: currentUser.email,
+          ownerEmail: currentUser.email
         })
       });
 
@@ -268,9 +296,12 @@ export default function App() {
     setQdIsLoading(true);
     triggerToast(`Payment prompt sent to ${qdPhone || 'mobile device'}... Please check your screen.`);
 
+    const selectedCampaignTitle = campaigns.find(c => c.id === campaignId)?.title || 'this campaign';
+
     try {
       if (qdMethod === 'M-Pesa Express') {
-        // Trigger STK Push (sandbox) and wait briefly for callback to land.
+        // Trigger STK Push and then poll the status endpoint until Safaricom's
+        // (or the sandbox simulation's) callback resolves the payment.
         const res = await fetch('/api/mpesa/stkpush', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -286,32 +317,34 @@ export default function App() {
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
           triggerToast(err.error || 'Failed to initiate M-Pesa STK Push');
+          setQdIsLoading(false);
           return;
         }
 
-        triggerToast(`M-Pesa prompt sent. Authorize on your phone to complete payment.`);
-        // Give Safaricom time to call callback (sandbox is quick but async).
-        setQdIsLoading(true);
-        setTimeout(async () => {
-          try {
-            await fetchCampaigns();
-            if (currentUser) {
-              await fetchMyContributions(currentUser.email);
-              setCurrentUser(prev => prev ? {
-                ...prev,
-                totalContributed: (prev.totalContributed || 0) + finalAmount,
-                campaignsSupported: (prev.campaignsSupported || 0) + 1
-              } : null);
-            }
-            setQdSuccess(true);
-            setQdCustomStr('');
-            triggerToast(`Thank you! KES ${finalAmount.toLocaleString()} recorded! 🎉`);
-          } catch {
-            triggerToast('STK push initiated, but ledger update may still be pending.');
-          } finally {
-            setQdIsLoading(false);
+        const pushData = await res.json();
+        triggerToast(`M-Pesa prompt sent to ${qdPhone}. Authorize on your phone to complete payment.`);
+
+        const outcome = await pollMpesaStatus(pushData.checkoutRequestId);
+        if (outcome === 'completed') {
+          await fetchCampaigns();
+          if (currentUser) {
+            await fetchMyContributions(currentUser.email);
+            setCurrentUser(prev => prev ? {
+              ...prev,
+              totalContributed: (prev.totalContributed || 0) + finalAmount,
+              campaignsSupported: (prev.campaignsSupported || 0) + 1
+            } : null);
           }
-        }, 6000);
+          setLastDonation({ amount: finalAmount, campaignTitle: selectedCampaignTitle, method: 'M-Pesa STK Push' });
+          setQdSuccess(true);
+          setQdCustomStr('');
+          triggerToast(`Thank you! KES ${finalAmount.toLocaleString()} received via M-Pesa! 🎉`);
+        } else if (outcome === 'failed') {
+          triggerToast('M-Pesa payment was declined or cancelled. Please try again.');
+        } else {
+          triggerToast('Still awaiting M-Pesa confirmation. Check your ledger shortly.');
+        }
+        setQdIsLoading(false);
       } else {
         // Fallback to existing simulation flow for non-M-Pesa gateways.
         setTimeout(async () => {
@@ -338,6 +371,7 @@ export default function App() {
                   campaignsSupported: (prev.campaignsSupported || 0) + 1
                 } : null);
               }
+              setLastDonation({ amount: finalAmount, campaignTitle: selectedCampaignTitle, method: qdMethod });
               setQdSuccess(true);
               setQdCustomStr('');
               triggerToast(`Thank you! KES ${finalAmount.toLocaleString()} verified and recorded! 🎉`);
@@ -466,6 +500,9 @@ export default function App() {
     if (registerPassword.length < 8) {
       newErrors.regPassword = "Password must be at least 8 characters.";
     }
+    if (selectedRole === 'admin' && !registerAdminCode.trim()) {
+      newErrors.regAdminCode = "An admin access code is required to register as an administrator.";
+    }
 
     if (Object.keys(newErrors).length > 0) {
       setErrors(newErrors);
@@ -482,7 +519,8 @@ export default function App() {
           email: registerEmail,
           password: registerPassword,
           role: selectedRole,
-          photoUrl: registeredPhotoUrl
+          photoUrl: registeredPhotoUrl,
+          adminCode: registerAdminCode
         })
       });
       if (res.ok) {
@@ -494,6 +532,7 @@ export default function App() {
         setRegisterEmail('');
         setRegisterPassword('');
         setRegisteredPhotoUrl('');
+        setRegisterAdminCode('');
       } else {
         const errorData = await res.json();
         triggerToast(errorData.error || "Failed to register account.");
@@ -529,6 +568,7 @@ export default function App() {
       });
 
       if (res.ok) {
+        const data = await res.json().catch(() => ({}));
         await fetchCampaigns();
         if (currentUser) {
           await fetchMyContributions(currentUser.email);
@@ -538,7 +578,16 @@ export default function App() {
             campaignsSupported: (prev.campaignsSupported || 0) + 1
           } : null);
         }
+        // Capture the real donated amount BEFORE clearing the input, so the
+        // confirmation shows the correct value (previously it fell back to the
+        // default preset after customAmountStr was reset).
+        setLastDonation({
+          amount: finalAmount,
+          campaignTitle: data?.campaign?.title || 'this campaign',
+          method: 'M-Pesa Express'
+        });
         setDonationSuccess(true);
+        setShowReceiptModal(true);
         setCustomAmountStr('');
         triggerToast(`Successfully contributed KES ${finalAmount.toLocaleString()}! Thank you for your transparency!`);
       } else {
@@ -555,6 +604,64 @@ export default function App() {
     triggerToast("Direct payment & campaign link copied to clipboard!");
   };
 
+  // Delete a campaign (admin: any; organisation: only its own).
+  const handleDeleteCampaign = async (campaign: Campaign) => {
+    if (!currentUser) return;
+    const confirmed = window.confirm(`Permanently delete "${campaign.title}"?\n\nThis removes the campaign and its contribution records. This action cannot be undone.`);
+    if (!confirmed) return;
+
+    try {
+      const res = await fetch(`/api/campaigns/${campaign.id}?requesterEmail=${encodeURIComponent(currentUser.email)}`, {
+        method: 'DELETE'
+      });
+      if (res.ok) {
+        await fetchCampaigns();
+        if (role === 'admin') await fetchAdminData();
+        triggerToast(`Campaign "${campaign.title}" was deleted.`);
+        if (activePage === 'detail') setActivePage('browse');
+      } else {
+        const err = await res.json().catch(() => ({}));
+        triggerToast(err.error || "Failed to delete campaign.");
+      }
+    } catch {
+      triggerToast("Network error while deleting campaign.");
+    }
+  };
+
+  // Load platform-wide data for the admin dashboard.
+  const fetchAdminData = async () => {
+    if (!currentUser || currentUser.role !== 'admin') return;
+    try {
+      const q = `requesterEmail=${encodeURIComponent(currentUser.email)}`;
+      const [uRes, cRes] = await Promise.all([
+        fetch(`/api/admin/users?${q}`),
+        fetch(`/api/admin/contributions?${q}`)
+      ]);
+      if (uRes.ok) setAdminUsers(await uRes.json());
+      if (cRes.ok) setAdminContributions(await cRes.json());
+    } catch (e) {
+      console.error("Failed to load admin dashboard data.", e);
+    }
+  };
+
+  // Poll the STK push status endpoint until the async callback resolves it.
+  const pollMpesaStatus = async (checkoutRequestId: string, maxTries = 12): Promise<'completed' | 'failed' | 'timeout'> => {
+    for (let i = 0; i < maxTries; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      try {
+        const res = await fetch(`/api/mpesa/status/${encodeURIComponent(checkoutRequestId)}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.status === 'completed') return 'completed';
+          if (data.status === 'failed') return 'failed';
+        }
+      } catch {
+        // keep polling
+      }
+    }
+    return 'timeout';
+  };
+
   // --- COMPUTED ---
   const activeCampaign = selectedCampaignId !== null 
     ? campaigns.find(c => c.id === selectedCampaignId) 
@@ -562,11 +669,38 @@ export default function App() {
 
   const filteredCampaigns = campaigns.filter(c => {
     const matchesCat = selectedCategory === 'All' || c.category === selectedCategory;
-    const matchesSearch = c.title.toLowerCase().includes(searchQuery.toLowerCase()) || 
+    const matchesSearch = c.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
                           c.short.toLowerCase().includes(searchQuery.toLowerCase()) ||
                           c.org.toLowerCase().includes(searchQuery.toLowerCase());
     return matchesCat && matchesSearch;
   });
+
+  // --- ROLE-BASED ACCESS HELPERS ---
+  const role = currentUser?.role;
+  const canCreateCampaign = role === 'organisation' || role === 'admin';
+  const canDeleteCampaign = (c: Campaign): boolean => {
+    if (role === 'admin') return true;
+    if (role === 'organisation' && c.ownerEmail && currentUser) {
+      return c.ownerEmail.toLowerCase() === currentUser.email.toLowerCase();
+    }
+    return false;
+  };
+  // Campaigns owned by the currently logged-in organisation.
+  const myOwnedCampaigns = currentUser
+    ? campaigns.filter(c => c.ownerEmail && c.ownerEmail.toLowerCase() === currentUser.email.toLowerCase())
+    : [];
+
+  // --- LIVE PLATFORM STATS (computed from real campaign data) ---
+  const totalRaised = campaigns.reduce((sum, c) => sum + (c.raised || 0), 0);
+  const totalDonors = campaigns.reduce((sum, c) => sum + (c.donors || 0), 0);
+  const verifiedPct = campaigns.length
+    ? Math.round((campaigns.filter(c => c.verified).length / campaigns.length) * 100)
+    : 100;
+  const formatKES = (n: number): string => {
+    if (n >= 1_000_000) return `KES ${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `KES ${(n / 1_000).toFixed(0)}K`;
+    return `KES ${n.toLocaleString()}`;
+  };
 
   return (
     <div className="min-h-screen bg-[#f4f6f4] text-[#1c2b22] font-sans flex flex-col antialiased selection:bg-emerald-100 selection:text-emerald-900">
@@ -609,16 +743,19 @@ export default function App() {
               Campaigns
             </button>
 
-            {/* Quick Trigger CTAs */}
-            <button 
-              onClick={() => {
-                setNcSuccess(false);
-                setShowStartCampaignModal(true);
-              }}
-              className="hidden sm:inline-block px-3 py-1.5 rounded-md text-xs font-bold text-emerald-100 border border-emerald-300/30 hover:border-white hover:text-white transition-all cursor-pointer"
-            >
-              Start Campaign
-            </button>
+            {/* Quick Trigger CTAs — creating campaigns is restricted to
+                organisation and admin accounts. */}
+            {canCreateCampaign && (
+              <button
+                onClick={() => {
+                  setNcSuccess(false);
+                  setShowStartCampaignModal(true);
+                }}
+                className="hidden sm:inline-block px-3 py-1.5 rounded-md text-xs font-bold text-emerald-100 border border-emerald-300/30 hover:border-white hover:text-white transition-all cursor-pointer"
+              >
+                Start Campaign
+              </button>
+            )}
 
             <button 
               onClick={() => {
@@ -718,19 +855,19 @@ export default function App() {
             <section className="bg-white border-b border-emerald-100/60 shadow-sm">
               <div className="max-w-7xl mx-auto grid grid-cols-2 md:grid-cols-4 divide-y md:divide-y-0 md:divide-x divide-emerald-100/40">
                 <div className="py-6 px-4 text-center">
-                  <div className="text-2xl md:text-3xl font-bold text-[#145a32]">KES 4.2M</div>
+                  <div className="text-2xl md:text-3xl font-bold text-[#145a32]">{formatKES(totalRaised)}</div>
                   <div className="text-xs text-gray-500 font-bold uppercase tracking-wider mt-1">Total Raised</div>
                 </div>
                 <div className="py-6 px-4 text-center">
-                  <div className="text-2xl md:text-3xl font-bold text-[#145a32]">48</div>
+                  <div className="text-2xl md:text-3xl font-bold text-[#145a32]">{campaigns.length}</div>
                   <div className="text-xs text-gray-500 font-bold uppercase tracking-wider mt-1">Active Campaigns</div>
                 </div>
                 <div className="py-6 px-4 text-center">
-                  <div className="text-2xl md:text-3xl font-bold text-[#145a32]">1,830</div>
+                  <div className="text-2xl md:text-3xl font-bold text-[#145a32]">{totalDonors.toLocaleString()}</div>
                   <div className="text-xs text-gray-500 font-bold uppercase tracking-wider mt-1">Donors</div>
                 </div>
                 <div className="py-6 px-4 text-center">
-                  <div className="text-2xl md:text-3xl font-bold text-[#145a32]">100%</div>
+                  <div className="text-2xl md:text-3xl font-bold text-[#145a32]">{verifiedPct}%</div>
                   <div className="text-xs text-gray-500 font-bold uppercase tracking-wider mt-1">Verified Orgs</div>
                 </div>
               </div>
@@ -915,11 +1052,23 @@ export default function App() {
                         }}
                         className="bg-white rounded-xl overflow-hidden shadow-sm hover:shadow-md border border-emerald-50/70 transition-all hover:-translate-y-1 cursor-pointer flex flex-col h-full"
                       >
-                        <div 
-                          className="py-10 text-center text-5xl select-none"
+                        <div
+                          className="py-10 text-center text-5xl select-none relative"
                           style={{ backgroundColor: c.color }}
                         >
                           {c.icon}
+                          {canDeleteCampaign(c) && (
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDeleteCampaign(c);
+                              }}
+                              title="Delete campaign"
+                              className="absolute top-2 right-2 bg-white/80 hover:bg-red-500 text-red-500 hover:text-white p-1.5 rounded-lg shadow-sm transition-colors cursor-pointer"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                            </button>
+                          )}
                         </div>
 
                         <div className="p-5 flex-1 flex flex-col">
@@ -1110,8 +1259,21 @@ export default function App() {
                       <div className="bg-emerald-100/80 border border-emerald-200 rounded-xl p-4 text-center space-y-2">
                         <CheckCircle className="w-8 h-8 text-emerald-600 mx-auto" />
                         <h4 className="font-bold text-[#0a3d1f] text-sm">Donation Confirmed!</h4>
-                        <p className="text-xs text-gray-600">Your contribution of KES {(customAmountStr ? parseInt(customAmountStr) : donationAmount).toLocaleString()} was securely logged in real-time!</p>
-                        <button 
+                        <div className="bg-white/70 rounded-lg py-2.5 px-3 border border-emerald-200/60">
+                          <div className="text-2xl font-serif font-black text-emerald-800 leading-none">
+                            KES {(lastDonation?.amount ?? 0).toLocaleString()}
+                          </div>
+                          <div className="text-[10px] text-gray-500 font-semibold uppercase tracking-wider mt-1">
+                            via {lastDonation?.method || 'M-Pesa Express'}
+                          </div>
+                        </div>
+                        <p className="text-xs text-gray-600">
+                          Your contribution to <strong className="text-emerald-900">{lastDonation?.campaignTitle || activeCampaign.title}</strong> was securely logged in real-time.
+                          {currentUser
+                            ? ' It now appears in your contributions ledger.'
+                            : ' Log in before donating to track it in your personal ledger.'}
+                        </p>
+                        <button
                           onClick={() => setDonationSuccess(false)}
                           className="text-xs font-bold text-emerald-700 hover:text-emerald-500 underline cursor-pointer mt-1"
                         >
@@ -1162,16 +1324,45 @@ export default function App() {
                       </div>
                     )}
 
-                    <button 
+                    <button
                       onClick={() => handleShareCampaign(activeCampaign)}
                       className="w-full border border-gray-200 bg-transparent text-gray-600 hover:border-emerald-300 hover:text-emerald-800 text-xs font-bold py-2.5 rounded-lg transition-colors cursor-pointer"
                     >
                       Share Campaign Link
                     </button>
+
+                    {/* Management: delete is restricted to admins and the owning organisation */}
+                    {canDeleteCampaign(activeCampaign) && (
+                      <button
+                        onClick={() => handleDeleteCampaign(activeCampaign)}
+                        className="w-full border border-red-200 bg-red-50/50 text-red-600 hover:bg-red-100 hover:border-red-300 text-xs font-bold py-2.5 rounded-lg transition-colors cursor-pointer flex items-center justify-center gap-1.5"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" /> Delete Campaign
+                        <span className="font-normal text-red-400">({role === 'admin' ? 'Admin' : 'Owner'})</span>
+                      </button>
+                    )}
                   </div>
                 </div>
               </div>
             </section>
+          </div>
+        )}
+
+        {/* Defensive fallback: on the detail route with no resolvable campaign
+            (e.g. after a deep link), show a recovery card instead of a blank page. */}
+        {activePage === 'detail' && !activeCampaign && (
+          <div className="flex-1 flex items-center justify-center p-6 anim-fade-in">
+            <div className="bg-white rounded-xl shadow-sm border border-emerald-50 p-10 text-center max-w-md">
+              <div className="text-4xl mb-3">🔍</div>
+              <h3 className="font-bold text-gray-800 text-base mb-1">Campaign not available</h3>
+              <p className="text-gray-500 text-xs mb-5">This campaign could not be loaded. Head back to browse all active campaigns.</p>
+              <button
+                onClick={() => { setSelectedCategory('All'); setActivePage('browse'); }}
+                className="bg-emerald-500 hover:bg-emerald-400 text-white text-xs font-bold py-2.5 px-5 rounded-lg shadow-sm cursor-pointer"
+              >
+                Back to Campaigns
+              </button>
+            </div>
           </div>
         )}
 
@@ -1260,7 +1451,7 @@ export default function App() {
                     </button>
 
                     <p className="text-xs text-center text-gray-500 mt-4 leading-normal select-none">
-                      Demo Account Mode: Enter any email/password to instantiate temporary session token.
+                      New here? Switch to <strong className="text-emerald-700">Create Account</strong> first. Passwords are securely hashed and verified on login.
                     </p>
                   </form>
                 )}
@@ -1289,6 +1480,12 @@ export default function App() {
                           </button>
                         ))}
                       </div>
+                      {/* What each role can do */}
+                      <p className="text-[10px] text-gray-500 leading-normal bg-emerald-50/40 border border-emerald-100/50 rounded-lg px-2.5 py-1.5">
+                        {selectedRole === 'donor' && '🤝 Donors can browse & fund campaigns and track their giving ledger.'}
+                        {selectedRole === 'organisation' && '🏢 Organisations can do everything a donor can, plus launch and delete their own campaigns.'}
+                        {selectedRole === 'admin' && '🛡️ Admins oversee the whole platform: manage & delete any campaign and view all users and contributions. Requires an access code.'}
+                      </p>
                     </div>
 
                     {/* Full Name */}
@@ -1329,6 +1526,24 @@ export default function App() {
                       />
                       {errors.regPassword && <p className="text-red-500 text-[10px] font-bold mt-1">{errors.regPassword}</p>}
                     </div>
+
+                    {/* Admin access code — only shown/required for admin sign-up */}
+                    {selectedRole === 'admin' && (
+                      <div className="space-y-1">
+                        <label className="block text-xs font-bold text-[#1c2b22] flex items-center gap-1">
+                          <ShieldCheck className="w-3.5 h-3.5 text-emerald-700" /> Admin Access Code
+                        </label>
+                        <input
+                          type="password"
+                          value={registerAdminCode}
+                          onChange={(e) => setRegisterAdminCode(e.target.value)}
+                          placeholder="Enter the administrator access code"
+                          className={`bg-white text-gray-950 block w-full px-4 py-2 text-sm rounded-lg border ${errors.regAdminCode ? 'border-red-500 focus:outline-red-500' : 'border-gray-200 focus:outline-emerald-500'}`}
+                        />
+                        {errors.regAdminCode && <p className="text-red-500 text-[10px] font-bold mt-1">{errors.regAdminCode}</p>}
+                        <p className="text-[10px] text-gray-400">Admin privileges are gated behind a shared secret to prevent unauthorised elevation.</p>
+                      </div>
+                    )}
 
                     {/* PROFILE LOGO ALIGNMENT - MULTIPART INTEGRATION */}
                     <div className="space-y-2 pt-2 border-t border-emerald-50">
@@ -1530,6 +1745,133 @@ export default function App() {
                       </div>
                     )}
                   </div>
+
+                  {/* ORGANISATION PANEL — manage your own campaigns */}
+                  {role === 'organisation' && (
+                    <div className="bg-white rounded-2xl p-6 shadow-sm border border-emerald-50/70">
+                      <div className="flex items-center justify-between border-b border-emerald-50 pb-3 mb-4">
+                        <div className="flex items-center gap-2">
+                          <Briefcase className="w-5 h-5 text-emerald-600" />
+                          <h3 className="font-serif font-bold text-[#0a3d1f] text-base">My Campaigns</h3>
+                        </div>
+                        <button
+                          onClick={() => { setNcSuccess(false); setShowStartCampaignModal(true); }}
+                          className="bg-emerald-500 hover:bg-emerald-400 text-white text-xs font-bold py-1.5 px-3 rounded-lg flex items-center gap-1 cursor-pointer"
+                        >
+                          <Plus className="w-3.5 h-3.5" /> New
+                        </button>
+                      </div>
+
+                      {myOwnedCampaigns.length > 0 ? (
+                        <div className="space-y-3">
+                          {myOwnedCampaigns.map((c) => (
+                            <div key={c.id} className="flex items-center gap-3 p-3 rounded-xl border border-emerald-50 hover:border-emerald-100 transition-colors">
+                              <div className="w-10 h-10 rounded-lg flex items-center justify-center text-xl shrink-0" style={{ backgroundColor: c.color }}>{c.icon}</div>
+                              <div className="flex-1 min-w-0">
+                                <button onClick={() => { setSelectedCampaignId(c.id); setDonationSuccess(false); setActivePage('detail'); }} className="font-bold text-xs text-gray-900 truncate hover:text-emerald-700 text-left w-full cursor-pointer">{c.title}</button>
+                                <div className="text-[10px] text-gray-500 mt-0.5">KES {c.raised.toLocaleString()} raised · {c.donors} donors · {Math.round((c.raised / c.target) * 100)}% funded</div>
+                              </div>
+                              <button
+                                onClick={() => handleDeleteCampaign(c)}
+                                title="Delete campaign"
+                                className="text-red-500 hover:text-white hover:bg-red-500 p-2 rounded-lg transition-colors cursor-pointer shrink-0"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <div className="p-6 text-center text-gray-500">
+                          <Briefcase className="w-9 h-9 text-emerald-100 mx-auto mb-2" />
+                          <h4 className="font-bold text-xs">You haven't launched any campaigns yet</h4>
+                          <p className="text-[10px] text-gray-400 mt-1">Click “New” to publish your first verified campaign.</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* ADMIN CONTROL CENTER — full platform oversight */}
+                  {role === 'admin' && (
+                    <div className="space-y-6">
+                      <div className="bg-gradient-to-br from-[#0a3d1f] to-[#145a32] text-white rounded-2xl p-6 shadow-sm">
+                        <div className="flex items-center gap-2 mb-4">
+                          <ShieldAlert className="w-5 h-5 text-emerald-300" />
+                          <h3 className="font-serif font-bold text-base">Admin Control Center</h3>
+                        </div>
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                          <div className="bg-white/10 rounded-xl p-3 border border-white/10">
+                            <div className="text-lg font-black">{campaigns.length}</div>
+                            <div className="text-[9px] uppercase tracking-wider text-emerald-200 font-bold">Campaigns</div>
+                          </div>
+                          <div className="bg-white/10 rounded-xl p-3 border border-white/10">
+                            <div className="text-lg font-black">{adminUsers.length}</div>
+                            <div className="text-[9px] uppercase tracking-wider text-emerald-200 font-bold">Users</div>
+                          </div>
+                          <div className="bg-white/10 rounded-xl p-3 border border-white/10">
+                            <div className="text-lg font-black">{adminContributions.length}</div>
+                            <div className="text-[9px] uppercase tracking-wider text-emerald-200 font-bold">Donations</div>
+                          </div>
+                          <div className="bg-white/10 rounded-xl p-3 border border-white/10">
+                            <div className="text-lg font-black">{formatKES(totalRaised)}</div>
+                            <div className="text-[9px] uppercase tracking-wider text-emerald-200 font-bold">Raised</div>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Manage all campaigns */}
+                      <div className="bg-white rounded-2xl p-6 shadow-sm border border-emerald-50/70">
+                        <h3 className="font-serif font-bold text-[#0a3d1f] text-base border-b border-emerald-50 pb-3 mb-4 flex items-center gap-2">
+                          <Layers className="w-5 h-5 text-emerald-600" /> Manage All Campaigns
+                        </h3>
+                        <div className="space-y-2">
+                          {campaigns.map((c) => (
+                            <div key={c.id} className="flex items-center gap-3 p-2.5 rounded-xl border border-emerald-50">
+                              <div className="w-9 h-9 rounded-lg flex items-center justify-center text-lg shrink-0" style={{ backgroundColor: c.color }}>{c.icon}</div>
+                              <div className="flex-1 min-w-0">
+                                <div className="font-bold text-xs text-gray-900 truncate">{c.title}</div>
+                                <div className="text-[10px] text-gray-500">{c.org}{c.ownerEmail ? ` · ${c.ownerEmail}` : ' · platform'}</div>
+                              </div>
+                              <button onClick={() => handleDeleteCampaign(c)} title="Delete campaign" className="text-red-500 hover:text-white hover:bg-red-500 p-2 rounded-lg transition-colors cursor-pointer shrink-0">
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* All registered users */}
+                      <div className="bg-white rounded-2xl p-6 shadow-sm border border-emerald-50/70">
+                        <h3 className="font-serif font-bold text-[#0a3d1f] text-base border-b border-emerald-50 pb-3 mb-4 flex items-center gap-2">
+                          <Users2 className="w-5 h-5 text-emerald-600" /> Registered Users ({adminUsers.length})
+                        </h3>
+                        <div className="relative overflow-x-auto">
+                          <table className="w-full text-left border-collapse text-xs">
+                            <thead>
+                              <tr className="border-b border-emerald-50 text-gray-400 uppercase tracking-widest font-bold">
+                                <th className="py-2 font-bold">Name</th>
+                                <th className="py-2 font-bold">Email</th>
+                                <th className="py-2 font-bold">Role</th>
+                                <th className="py-2 font-bold text-right">Given (KES)</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {adminUsers.map((u) => (
+                                <tr key={u.email} className="border-b border-emerald-50">
+                                  <td className="py-2.5 font-bold text-gray-900">{u.name}</td>
+                                  <td className="py-2.5 font-mono text-gray-500 truncate max-w-[140px]">{u.email}</td>
+                                  <td className="py-2.5">
+                                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-800 capitalize font-bold">{u.role}</span>
+                                  </td>
+                                  <td className="py-2.5 text-right font-bold text-emerald-800">{(u.totalContributed || 0).toLocaleString()}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
               </div>
             ) : (
@@ -1956,12 +2298,18 @@ export default function App() {
                     </div>
                     <div className="space-y-2">
                       <h4 className="font-serif text-[#0a3d1f] font-bold text-xl">Payment Cleared Successfully!</h4>
+                      {lastDonation && (
+                        <div className="bg-emerald-50 border border-emerald-100 rounded-xl py-3 px-4 max-w-xs mx-auto">
+                          <div className="text-2xl font-serif font-black text-emerald-800 leading-none">KES {lastDonation.amount.toLocaleString()}</div>
+                          <div className="text-[10px] text-gray-500 font-semibold uppercase tracking-wider mt-1">to {lastDonation.campaignTitle} · {lastDonation.method}</div>
+                        </div>
+                      )}
                       <p className="text-gray-500 text-xs max-w-sm mx-auto leading-relaxed mt-1">
-                        Your support has been linked. We have logged the transaction into your public ledger statement instantly! Check your profile to inspect the receipts.
+                        Your support has been linked and logged into your ledger statement instantly! Check your profile to inspect the receipts.
                       </p>
                     </div>
-                    
-                    <button 
+
+                    <button
                       onClick={() => {
                         setQdSuccess(false);
                         setShowQuickDonateModal(false);
@@ -2107,6 +2455,105 @@ export default function App() {
 
                   </form>
                 )}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* ── DONATION RECEIPT POPUP (shown after a successful contribution) ── */}
+      <AnimatePresence>
+        {showReceiptModal && lastDonation && (
+          <div className="fixed inset-0 z-[10000] flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setShowReceiptModal(false)}
+              className="fixed inset-0 bg-[#06200f]/80 backdrop-blur-sm"
+            />
+            <motion.div
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              transition={{ type: 'spring', stiffness: 300, damping: 24 }}
+              className="relative w-full max-w-sm bg-white rounded-2xl shadow-2xl border border-emerald-100 overflow-hidden z-10 text-center"
+            >
+              {/* Close */}
+              <button
+                onClick={() => setShowReceiptModal(false)}
+                className="absolute top-3 right-3 text-gray-400 hover:text-emerald-900 hover:bg-emerald-50 p-1.5 rounded-full transition-colors cursor-pointer z-10"
+              >
+                <X className="w-5 h-5" />
+              </button>
+
+              {/* Success banner */}
+              <div className="bg-gradient-to-br from-[#0a3d1f] to-[#145a32] pt-8 pb-10 px-6">
+                <motion.div
+                  initial={{ scale: 0 }}
+                  animate={{ scale: 1 }}
+                  transition={{ delay: 0.1, type: 'spring', stiffness: 260, damping: 18 }}
+                  className="w-16 h-16 bg-emerald-500 rounded-full flex items-center justify-center mx-auto shadow-lg border-4 border-white/20"
+                >
+                  <Check className="w-8 h-8 text-white" strokeWidth={3} />
+                </motion.div>
+                <h3 className="font-serif text-white text-xl font-bold mt-4">Donation Sent!</h3>
+                <p className="text-emerald-200 text-xs mt-1">Your contribution was securely recorded.</p>
+              </div>
+
+              {/* Receipt body */}
+              <div className="px-6 py-6 -mt-5">
+                <div className="bg-white rounded-xl shadow-md border border-emerald-100 p-5">
+                  <div className="text-3xl font-serif font-black text-emerald-800 leading-none">
+                    KES {lastDonation.amount.toLocaleString()}
+                  </div>
+                  <div className="text-[10px] text-gray-400 font-bold uppercase tracking-widest mt-2">Amount Donated</div>
+
+                  <div className="border-t border-dashed border-emerald-100 my-4" />
+
+                  <div className="space-y-2 text-left">
+                    <div className="flex justify-between items-center gap-3">
+                      <span className="text-[11px] text-gray-500 font-semibold shrink-0">Campaign</span>
+                      <span className="text-xs text-gray-900 font-bold text-right truncate">{lastDonation.campaignTitle}</span>
+                    </div>
+                    <div className="flex justify-between items-center gap-3">
+                      <span className="text-[11px] text-gray-500 font-semibold shrink-0">Method</span>
+                      <span className="text-xs text-emerald-800 font-bold">{lastDonation.method}</span>
+                    </div>
+                    <div className="flex justify-between items-center gap-3">
+                      <span className="text-[11px] text-gray-500 font-semibold shrink-0">Status</span>
+                      <span className="inline-flex items-center gap-1 text-xs text-emerald-700 font-bold">
+                        <CheckCircle className="w-3.5 h-3.5" /> Confirmed
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <p className="text-[11px] text-gray-500 mt-4 leading-relaxed">
+                  {currentUser
+                    ? 'This contribution now appears in your transparent ledger.'
+                    : 'Log in before donating to track contributions in your personal ledger.'}
+                </p>
+
+                <div className="flex gap-2 mt-5">
+                  <button
+                    onClick={() => setShowReceiptModal(false)}
+                    className="flex-1 border border-emerald-200 text-emerald-800 hover:bg-emerald-50 text-xs font-bold py-2.5 rounded-xl transition-colors cursor-pointer"
+                  >
+                    Close
+                  </button>
+                  {currentUser && (
+                    <button
+                      onClick={() => {
+                        setShowReceiptModal(false);
+                        setActivePage('profile');
+                      }}
+                      className="flex-1 bg-[#0a3d1f] hover:bg-[#145a32] text-white text-xs font-bold py-2.5 rounded-xl shadow-md transition-colors cursor-pointer"
+                    >
+                      View My Ledger
+                    </button>
+                  )}
+                </div>
               </div>
             </motion.div>
           </div>

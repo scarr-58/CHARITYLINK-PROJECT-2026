@@ -19,6 +19,34 @@ async function httpJson<T = any>(url: string, options: any): Promise<T> {
   }
 }
 
+// --- PASSWORD SECURITY ---
+// Passwords are never stored in plain text. We derive a salted scrypt hash and
+// store it as "salt:hash". Verification is done with a constant-time compare.
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const derived = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${derived}`;
+}
+
+function verifyPassword(password: string, stored?: string): boolean {
+  if (!stored || !stored.includes(":")) return false;
+  const [salt, key] = stored.split(":");
+  const keyBuffer = Buffer.from(key, "hex");
+  const derived = crypto.scryptSync(password, salt, 64);
+  return keyBuffer.length === derived.length && crypto.timingSafeEqual(keyBuffer, derived);
+}
+
+// Removes the password hash before a user record is sent to the client.
+function sanitizeUser<T extends { password?: string }>(user: T): Omit<T, "password"> {
+  const { password, ...safe } = user;
+  return safe;
+}
+
+// The secret code required to self-register as an administrator. Keeping admin
+// creation behind a shared secret prevents anyone from granting themselves
+// elevated privileges through the public registration form.
+const ADMIN_ACCESS_CODE = process.env.ADMIN_CODE || "CHARITY-ADMIN-2026";
+
 
 
 interface Contribution {
@@ -59,6 +87,7 @@ interface CampaignRecord {
   impact: Array<{ num: string; lbl: string }>;
   usage: string;
   color: string;
+  ownerEmail?: string;
 }
 
 interface DatabaseSchema {
@@ -221,7 +250,8 @@ async function createTables() {
       verified TINYINT(1) DEFAULT 1,
       impact TEXT NOT NULL,
       \`usage\` TEXT NOT NULL,
-      color VARCHAR(255) NOT NULL
+      color VARCHAR(255) NOT NULL,
+      ownerEmail VARCHAR(255)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
@@ -338,6 +368,30 @@ function saveDB(db: DatabaseSchema) {
   } catch (err) {
     console.error("Error writing to database store:", err);
   }
+}
+
+// Looks up a single user by email across whichever store is active.
+async function getUserByEmail(email: string): Promise<UserRecord | null> {
+  const normalized = email.trim().toLowerCase();
+  try {
+    if (isUsingMySQL && pool) {
+      const [rows]: any = await pool.query("SELECT * FROM users WHERE LOWER(email) = ?", [normalized]);
+      return rows[0] || null;
+    }
+  } catch (err) {
+    console.error("getUserByEmail error:", err);
+  }
+  const db = loadDB();
+  return db.users.find(u => u.email.toLowerCase() === normalized) || null;
+}
+
+// Resolves the acting user for a protected request. The requester is identified
+// by email (query, body, or header) and the authoritative role is read back
+// from the database — we never trust a role claimed by the client.
+async function resolveRequester(req: any): Promise<UserRecord | null> {
+  const email = (req.query?.requesterEmail || req.body?.requesterEmail || req.headers["x-user-email"]) as string | undefined;
+  if (!email) return null;
+  return getUserByEmail(String(email));
 }
 
 // Shared donation-recording logic used by both the direct /donate endpoint
@@ -503,10 +557,17 @@ async function startServer() {
 
   // Create a new campaign
   app.post("/api/campaigns", async (req, res) => {
-    const { title, org, desc, short, target, category, icon, color } = req.body;
+    const { title, org, desc, short, target, category, icon, color, ownerEmail } = req.body;
     if (!title || !org || !desc || !short || !target || !category || !icon) {
       return res.status(400).json({ error: "Missing required fields to initialize a campaign." });
     }
+
+    // Only verified organisations and admins may launch campaigns.
+    const creator = await resolveRequester(req);
+    if (!creator || (creator.role !== "organisation" && creator.role !== "admin")) {
+      return res.status(403).json({ error: "Only organisation or admin accounts can launch campaigns." });
+    }
+    const resolvedOwner = (ownerEmail || creator.email || "").toString().trim().toLowerCase();
 
     const impactObj = [
       { num: "0%", lbl: "Target achieved" },
@@ -517,7 +578,7 @@ async function startServer() {
     try {
       if (isUsingMySQL && pool) {
         const [result]: any = await pool.query(
-          "INSERT INTO campaigns (icon, category, title, org, `desc`, short, raised, target, donors, verified, impact, `usage`, color) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO campaigns (icon, category, title, org, `desc`, short, raised, target, donors, verified, impact, `usage`, color, ownerEmail) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
           [
             icon,
             category,
@@ -531,7 +592,8 @@ async function startServer() {
             1,
             JSON.stringify(impactObj),
             usageText,
-            color || "#eafaf1"
+            color || "#eafaf1",
+            resolvedOwner
           ]
         );
         const newCampaign = {
@@ -548,7 +610,8 @@ async function startServer() {
           verified: true,
           impact: impactObj,
           usage: usageText,
-          color: color || "#eafaf1"
+          color: color || "#eafaf1",
+          ownerEmail: resolvedOwner
         };
         return res.status(201).json(newCampaign);
       }
@@ -572,12 +635,57 @@ async function startServer() {
       verified: true,
       impact: impactObj,
       usage: usageText,
-      color: color || "#eafaf1"
+      color: color || "#eafaf1",
+      ownerEmail: resolvedOwner
     };
 
     db.campaigns.push(newCampaign);
     saveDB(db);
     res.status(201).json(newCampaign);
+  });
+
+  // Delete a campaign. Admins may delete any campaign; organisations may delete
+  // only campaigns they own. The acting user's role is verified server-side.
+  app.delete("/api/campaigns/:id", async (req, res) => {
+    const campaignId = Number(req.params.id);
+    const requester = await resolveRequester(req);
+    if (!requester) {
+      return res.status(401).json({ error: "You must be logged in to delete a campaign." });
+    }
+
+    const isOwnerOf = (owner?: string) =>
+      !!owner && owner.toLowerCase() === requester.email.toLowerCase();
+
+    try {
+      if (isUsingMySQL && pool) {
+        const [rows]: any = await pool.query("SELECT * FROM campaigns WHERE id = ?", [campaignId]);
+        const campaign = rows?.[0];
+        if (!campaign) return res.status(404).json({ error: "Campaign not found." });
+
+        if (requester.role !== "admin" && !(requester.role === "organisation" && isOwnerOf(campaign.ownerEmail))) {
+          return res.status(403).json({ error: "You do not have permission to delete this campaign." });
+        }
+
+        await pool.query("DELETE FROM contributions WHERE campaignId = ?", [campaignId]);
+        await pool.query("DELETE FROM campaigns WHERE id = ?", [campaignId]);
+        return res.json({ success: true, id: campaignId });
+      }
+    } catch (err) {
+      console.error("MySQL delete error in /api/campaigns/:id:", err);
+    }
+
+    const db = loadDB();
+    const campaign = db.campaigns.find(c => c.id === campaignId);
+    if (!campaign) return res.status(404).json({ error: "Campaign not found." });
+
+    if (requester.role !== "admin" && !(requester.role === "organisation" && isOwnerOf(campaign.ownerEmail))) {
+      return res.status(403).json({ error: "You do not have permission to delete this campaign." });
+    }
+
+    db.campaigns = db.campaigns.filter(c => c.id !== campaignId);
+    db.contributions = db.contributions.filter(c => c.campaignId !== campaignId);
+    saveDB(db);
+    res.json({ success: true, id: campaignId });
   });
 
   // Log in user
@@ -593,98 +701,69 @@ async function startServer() {
       if (isUsingMySQL && pool) {
         const [users]: any = await pool.query("SELECT * FROM users WHERE LOWER(email) = ?", [normalizedEmail]);
         if (users.length === 0) {
-          const derivedName = normalizedEmail.split("@")[0].replace(/[._]/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-          await pool.query(
-            "INSERT INTO users (email, name, role, photoUrl, memberSince, totalContributed, campaignsSupported) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [normalizedEmail, derivedName, "donor", "", "June 2026", 25000, 2]
-          );
-
-          // Seed primary contributions
-          await pool.query(
-            "INSERT INTO contributions (id, campaignId, campaignTitle, category, donorName, donorEmail, amount, timestamp, paymentMethod) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [`seed_1_${normalizedEmail}`, 1, "Clean Water for Turkana County Schools", "Water", derivedName, normalizedEmail, 20000, new Date().toISOString(), "M-Pesa Express"]
-          );
-          await pool.query(
-            "INSERT INTO contributions (id, campaignId, campaignTitle, category, donorName, donorEmail, amount, timestamp, paymentMethod) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [`seed_2_${normalizedEmail}`, 2, "Bursary Fund for Kibera Secondary Students", "Education", derivedName, normalizedEmail, 5000, new Date().toISOString(), "MasterCard Secure"]
-          );
-
-          const newUser = {
-            name: derivedName,
-            email: normalizedEmail,
-            role: "donor",
-            photoUrl: "",
-            memberSince: "June 2026",
-            totalContributed: 25000,
-            campaignsSupported: 2
-          };
-          return res.json({ user: newUser });
-        } else {
-          return res.json({ user: users[0] });
+          return res.status(404).json({ error: "No account found with that email. Please create an account first." });
         }
+        const user = users[0];
+
+        if (user.password) {
+          if (!verifyPassword(password, user.password)) {
+            return res.status(401).json({ error: "Incorrect password. Please try again." });
+          }
+        } else {
+          // Legacy account created before password hashing existed: set the
+          // password on this first successful login so the account is secured.
+          await pool.query("UPDATE users SET password = ? WHERE LOWER(email) = ?", [hashPassword(password), normalizedEmail]);
+        }
+        return res.json({ user: sanitizeUser(user) });
       }
     } catch (err) {
       console.error("MySQL lookup error in /api/auth/login:", err);
     }
 
     const db = loadDB();
-    const user = db.users.find(u => u.email.toLowerCase() === normalizedEmail);
+    const userIndex = db.users.findIndex(u => u.email.toLowerCase() === normalizedEmail);
 
-    if (!user) {
-      const derivedName = normalizedEmail.split("@")[0].replace(/[._]/g, " ").replace(/\b\w/g, c => c.toUpperCase());
-      const newUser: UserRecord = {
-        name: derivedName,
-        email: normalizedEmail,
-        role: "donor",
-        photoUrl: "",
-        memberSince: "June 2026",
-        totalContributed: 25000,
-        campaignsSupported: 2
-      };
-      
-      db.users.push(newUser);
-      
-      const setupContributions: Contribution[] = [
-        {
-          id: `seed_1_${normalizedEmail}`,
-          campaignId: 1,
-          campaignTitle: "Clean Water for Turkana County Schools",
-          category: "Water",
-          donorName: derivedName,
-          donorEmail: normalizedEmail,
-          amount: 20000,
-          timestamp: new Date().toISOString(),
-          paymentMethod: "M-Pesa Express"
-        },
-        {
-          id: `seed_2_${normalizedEmail}`,
-          campaignId: 2,
-          campaignTitle: "Bursary Fund for Kibera Secondary Students",
-          category: "Education",
-          donorName: derivedName,
-          donorEmail: normalizedEmail,
-          amount: 5000,
-          timestamp: new Date().toISOString(),
-          paymentMethod: "MasterCard Secure"
-        }
-      ];
-
-      db.contributions.push(...setupContributions);
-      saveDB(db);
-      return res.json({ user: newUser });
+    if (userIndex === -1) {
+      return res.status(404).json({ error: "No account found with that email. Please create an account first." });
     }
 
-    res.json({ user });
+    const user = db.users[userIndex];
+    if (user.password) {
+      if (!verifyPassword(password, user.password)) {
+        return res.status(401).json({ error: "Incorrect password. Please try again." });
+      }
+    } else {
+      // Legacy account: secure it by storing the hash of the password used now.
+      db.users[userIndex].password = hashPassword(password);
+      saveDB(db);
+    }
+
+    res.json({ user: sanitizeUser(db.users[userIndex]) });
   });
 
   // Register user
   app.post("/api/auth/register", async (req, res) => {
-    const { name, email, password, role, photoUrl } = req.body;
+    const { name, email, password, role, photoUrl, adminCode } = req.body;
     if (!name || !email || !password) {
       return res.status(400).json({ error: "Missing required fields for account registration." });
     }
+    if (String(password).length < 8) {
+      return res.status(400).json({ error: "Password must be at least 8 characters." });
+    }
+
+    const requestedRole = (role || "donor").toString();
+    const allowedRoles = ["donor", "organisation", "admin"];
+    if (!allowedRoles.includes(requestedRole)) {
+      return res.status(400).json({ error: "Invalid account role selected." });
+    }
+    // Admin accounts require the shared admin access code so users cannot
+    // grant themselves elevated privileges through the public form.
+    if (requestedRole === "admin" && adminCode !== ADMIN_ACCESS_CODE) {
+      return res.status(403).json({ error: "Invalid admin access code. Administrator registration denied." });
+    }
 
     const normalizedEmail = email.trim().toLowerCase();
+    const passwordHash = hashPassword(password);
 
     try {
       if (isUsingMySQL && pool) {
@@ -694,14 +773,14 @@ async function startServer() {
         }
 
         await pool.query(
-          "INSERT INTO users (email, name, role, photoUrl, memberSince, totalContributed, campaignsSupported) VALUES (?, ?, ?, ?, ?, ?, ?)",
-          [normalizedEmail, name, role || "donor", photoUrl || "", "June 2026", 0, 0]
+          "INSERT INTO users (email, name, password, role, photoUrl, memberSince, totalContributed, campaignsSupported) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+          [normalizedEmail, name, passwordHash, requestedRole, photoUrl || "", "June 2026", 0, 0]
         );
 
         const newUser = {
           name,
           email: normalizedEmail,
-          role: role || "donor",
+          role: requestedRole,
           photoUrl: photoUrl || "",
           memberSince: "June 2026",
           totalContributed: 0,
@@ -723,7 +802,8 @@ async function startServer() {
     const newUser: UserRecord = {
       name,
       email: normalizedEmail,
-      role: role || "donor",
+      password: passwordHash,
+      role: requestedRole,
       photoUrl: photoUrl || "",
       memberSince: "June 2026",
       totalContributed: 0,
@@ -732,7 +812,7 @@ async function startServer() {
 
     db.users.push(newUser);
     saveDB(db);
-    res.status(201).json({ user: newUser });
+    res.status(201).json({ user: sanitizeUser(newUser) });
   });
 
   // Update photo endpoint
@@ -752,7 +832,7 @@ async function startServer() {
         }
         await pool.query("UPDATE users SET photoUrl = ? WHERE LOWER(email) = ?", [photoUrl || "", normalizedEmail]);
         const [updated]: any = await pool.query("SELECT * FROM users WHERE LOWER(email) = ?", [normalizedEmail]);
-        return res.json({ success: true, user: updated[0] });
+        return res.json({ success: true, user: sanitizeUser(updated[0]) });
       }
     } catch (err) {
       console.error("MySQL update error in /api/auth/update-photo:", err);
@@ -767,7 +847,43 @@ async function startServer() {
 
     db.users[userIndex].photoUrl = photoUrl || "";
     saveDB(db);
-    res.json({ success: true, user: db.users[userIndex] });
+    res.json({ success: true, user: sanitizeUser(db.users[userIndex]) });
+  });
+
+  // --- ADMIN ENDPOINTS (role-gated) ---
+  // Platform-wide views available only to administrators.
+  app.get("/api/admin/users", async (req, res) => {
+    const requester = await resolveRequester(req);
+    if (!requester || requester.role !== "admin") {
+      return res.status(403).json({ error: "Administrator access required." });
+    }
+    try {
+      if (isUsingMySQL && pool) {
+        const [rows]: any = await pool.query("SELECT * FROM users");
+        return res.json(rows.map((u: any) => sanitizeUser(u)));
+      }
+    } catch (err) {
+      console.error("MySQL query error in /api/admin/users:", err);
+    }
+    const db = loadDB();
+    res.json(db.users.map(u => sanitizeUser(u)));
+  });
+
+  app.get("/api/admin/contributions", async (req, res) => {
+    const requester = await resolveRequester(req);
+    if (!requester || requester.role !== "admin") {
+      return res.status(403).json({ error: "Administrator access required." });
+    }
+    try {
+      if (isUsingMySQL && pool) {
+        const [rows]: any = await pool.query("SELECT * FROM contributions ORDER BY timestamp DESC");
+        return res.json(rows);
+      }
+    } catch (err) {
+      console.error("MySQL query error in /api/admin/contributions:", err);
+    }
+    const db = loadDB();
+    res.json([...db.contributions].reverse());
   });
 
   // Submit donation
@@ -862,8 +978,50 @@ async function startServer() {
       const passkey = process.env.MPESA_PASSKEY;
       const callbackUrl = process.env.MPESA_CALLBACK_URL;
 
-      if (!consumerKey || !consumerSecret || !shortCode || !passkey || !callbackUrl) {
-        return res.status(500).json({ error: 'Missing MPESA env vars' });
+      const credsMissing = !consumerKey || !consumerSecret || !shortCode || !passkey || !callbackUrl;
+
+      // SIMULATION MODE: when real Safaricom Daraja credentials are not
+      // configured (or MPESA_SIMULATE=true), we emulate the full STK Push
+      // lifecycle locally so the donation flow works end-to-end in a demo.
+      // A pending reference is stored, then after a short delay we invoke the
+      // same recordDonation() used by the real callback and mark it completed.
+      if (credsMissing || process.env.MPESA_SIMULATE === 'true') {
+        const reference = `CL_SIM_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+        const checkoutRequestId = `ws_CO_SIM_${Date.now()}`;
+        const entry = {
+          campaignId: Number(campaignId),
+          amountKES: Number(amountKES),
+          donorEmail,
+          donorName,
+          createdAt: new Date().toISOString(),
+          status: 'pending' as const
+        };
+        const simMap = loadStkRefMap();
+        simMap[reference] = entry;
+        simMap[checkoutRequestId] = { ...entry };
+        saveStkRefMap(simMap);
+
+        // Emulate the asynchronous Safaricom callback.
+        setTimeout(async () => {
+          try {
+            const result = await recordDonation({
+              campaignId: Number(campaignId),
+              donationVal: Number(amountKES),
+              donorEmail,
+              donorName,
+              paymentMethod: 'M-Pesa STK Push'
+            });
+            const m = loadStkRefMap();
+            const finalStatus: 'completed' | 'failed' = result ? 'completed' : 'failed';
+            if (m[reference]) m[reference].status = finalStatus;
+            if (m[checkoutRequestId]) m[checkoutRequestId].status = finalStatus;
+            saveStkRefMap(m);
+          } catch (e) {
+            console.error('Simulated STK push error:', e);
+          }
+        }, 4000);
+
+        return res.json({ ok: true, checkoutRequestId, merchantRequestId: `SIM_${Date.now()}`, reference, simulated: true });
       }
 
       // Safaricom API base for sandbox/production
@@ -1076,7 +1234,17 @@ const records = db.contributions.filter((c: Contribution) => c.donorEmail.toLowe
 
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        // The server writes its JSON data files into the project root on every
+        // donation/registration. Without this, Vite's file watcher would detect
+        // those writes and trigger a full page reload — wiping in-memory React
+        // state (e.g. the selected campaign) and blanking the detail view. We
+        // ignore the data files so runtime writes never reload the client.
+        watch: {
+          ignored: ["**/data-store.json", "**/mpesa-reference-map.json"]
+        }
+      },
       appType: "spa"
     });
     app.use(vite.middlewares);

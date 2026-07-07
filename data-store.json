@@ -37,21 +37,21 @@
       "org": "Elimu Kwanza Foundation",
       "desc": "Hundreds of bright students in Kibera leave school each year not due to poor performance but because of school fee arrears. This fund pays full year tuition, exam fees, and provides learning materials for 80 Form 3 and Form 4 students who are at risk of dropping out.",
       "short": "Covering full tuition and exam fees for 80 secondary school students in Kibera who risk dropping out due to financial hardship.",
-      "raised": 220000,
+      "raised": 222000,
       "target": 400000,
-      "donors": 313,
+      "donors": 314,
       "verified": true,
       "impact": [
         {
-          "num": "55%",
+          "num": "56%",
           "lbl": "Target completed"
         },
         {
-          "num": "KES 703",
+          "num": "KES 707",
           "lbl": "Avg contribution"
         },
         {
-          "num": "313",
+          "num": "314",
           "lbl": "Steward handshakes"
         }
       ],
@@ -66,22 +66,22 @@
       "org": "Afya Yetu Health Trust",
       "desc": "Maternal mortality in Marsabit remains critically high due to distance from health facilities. This campaign equips and operates a mobile clinic that visits 18 remote villages monthly, providing antenatal care, safe delivery kits, postnatal follow-ups, and emergency referrals.",
       "short": "A mobile clinic serving 18 remote villages in Marsabit with antenatal care and emergency maternal health services.",
-      "raised": 520000,
+      "raised": 825000,
       "target": 700000,
-      "donors": 489,
+      "donors": 491,
       "verified": true,
       "impact": [
         {
-          "num": "18",
-          "lbl": "Villages Covered"
+          "num": "118%",
+          "lbl": "Target completed"
         },
         {
-          "num": "640",
-          "lbl": "Mothers Reached"
+          "num": "KES 1,680",
+          "lbl": "Avg contribution"
         },
         {
-          "num": "34",
-          "lbl": "Safe Deliveries"
+          "num": "491",
+          "lbl": "Steward handshakes"
         }
       ],
       "usage": "55% on medical supplies and equipment, 30% on fuel and vehicle maintenance, 10% on healthcare worker salaries, 5% on administration.",
@@ -153,22 +153,22 @@
       "org": "Msitu wa Kenya",
       "desc": "The Aberdare catchment feeds eight major rivers supplying Nairobi with water. Decades of encroachment have degraded 30,000 hectares. This campaign plants indigenous tree species, partners with local communities for stewardship, and monitors forest recovery through satellite imaging.",
       "short": "Planting indigenous trees across degraded Aberdare highland zones and training local communities as forest stewards.",
-      "raised": 295000,
+      "raised": 300000,
       "target": 500000,
-      "donors": 418,
+      "donors": 419,
       "verified": true,
       "impact": [
         {
-          "num": "45,000",
-          "lbl": "Trees Planted"
+          "num": "60%",
+          "lbl": "Target completed"
         },
         {
-          "num": "120ha",
-          "lbl": "Area Restored"
+          "num": "KES 716",
+          "lbl": "Avg contribution"
         },
         {
-          "num": "80",
-          "lbl": "Community Rangers"
+          "num": "419",
+          "lbl": "Steward handshakes"
         }
       ],
       "usage": "50% seedling nurseries and planting, 25% community ranger program, 15% monitoring technology, 10% education and outreach.",
@@ -207,6 +207,26 @@
       "name": "Oscar Tanui",
       "email": "oscar.tanui@gmail.com",
       "role": "donor",
+      "photoUrl": "",
+      "memberSince": "June 2026",
+      "totalContributed": 0,
+      "campaignsSupported": 0
+    },
+    {
+      "name": "oscar",
+      "email": "ym@gmail.com",
+      "password": "eda1721e25d22da8e66f649c4defb03b:bb862477ed62669314e81df963e4063a9eea45d0b84a1ca04434bb1601bb67885be0e1d8c4b55bbbeb8d6b43996f990cf7751c833dae67e191428da429253662",
+      "role": "donor",
+      "photoUrl": "",
+      "memberSince": "June 2026",
+      "totalContributed": 302000,
+      "campaignsSupported": 2
+    },
+    {
+      "name": "yaasir",
+      "email": "toscar@gmail.com",
+      "password": "8b8c86a91cf19f179d8d639dffff077d:36fe9e966d310c35cc591403d4b0f78a722cec4f0217cfd49db1ef0f3484e77b2806c7e9c891e14406266b9acce2181bcc0b0134ae51af2221e720de9baccfb3",
+      "role": "admin",
       "photoUrl": "",
       "memberSince": "June 2026",
       "totalContributed": 0,
@@ -300,6 +320,50 @@
       "donorEmail": "oscar@gmail.com",
       "amount": 2000,
       "timestamp": "2026-06-30T09:43:33.983Z",
+      "paymentMethod": "M-Pesa Express"
+    },
+    {
+      "id": "donation_1783406140018_iyj3q",
+      "campaignId": 3,
+      "campaignTitle": "Mobile Maternal Clinic — Marsabit",
+      "category": "Health",
+      "donorName": "yaasir",
+      "donorEmail": "toscar@gmail.com",
+      "amount": 5000,
+      "timestamp": "2026-07-07T06:35:40.018Z",
+      "paymentMethod": "M-Pesa Express"
+    },
+    {
+      "id": "donation_1783406178666_e8653",
+      "campaignId": 6,
+      "campaignTitle": "Reforesting the Aberdare Range",
+      "category": "Environment",
+      "donorName": "yaasir",
+      "donorEmail": "toscar@gmail.com",
+      "amount": 5000,
+      "timestamp": "2026-07-07T06:36:18.666Z",
+      "paymentMethod": "M-Pesa Express"
+    },
+    {
+      "id": "donation_1783406285178_av74r",
+      "campaignId": 2,
+      "campaignTitle": "Bursary Fund for Kibera Secondary Students",
+      "category": "Education",
+      "donorName": "oscar",
+      "donorEmail": "ym@gmail.com",
+      "amount": 2000,
+      "timestamp": "2026-07-07T06:38:05.178Z",
+      "paymentMethod": "M-Pesa Express"
+    },
+    {
+      "id": "donation_1783406315274_5331m",
+      "campaignId": 3,
+      "campaignTitle": "Mobile Maternal Clinic — Marsabit",
+      "category": "Health",
+      "donorName": "oscar",
+      "donorEmail": "ym@gmail.com",
+      "amount": 300000,
+      "timestamp": "2026-07-07T06:38:35.274Z",
       "paymentMethod": "M-Pesa Express"
     }
   ]
